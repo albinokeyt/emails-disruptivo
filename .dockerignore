@@ -1,0 +1,17 @@
+# Fuera del contexto de build. OJO: src/ entra entero (src/migrations incluido: las migraciones
+# se aplican al arrancar y sin ellas la app no puede crear el esquema).
+node_modules
+web/node_modules
+web/dist
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.log
+*.md
+docker-compose.yml
+.claude
+.vscode
+.idea
+certs

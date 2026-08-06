@@ -1,0 +1,15 @@
+node_modules/
+web/node_modules/
+web/dist/
+
+# secretos y certificados: nunca al repositorio
+.env
+.env.*
+!.env.example
+certs/
+*.pem
+*.key
+
+*.log
+.DS_Store
+Thumbs.db

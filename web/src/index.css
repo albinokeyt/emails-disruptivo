@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Emails Disruptivo — tema oscuro (fondo casi negro + oro)
+   Mismos tokens que el panel del marketplace para que los dos
+   productos de la agencia se vean como uno solo.
+   ============================================================ */
+@theme {
+  --color-bg: #0a0a0c;
+  --color-card: #131319;
+  --color-card2: #1a1a22;
+  --color-border: #26262f;
+  --color-ink: #f0eee8;
+  --color-ink2: #a8adb8;
+  --color-mut: #6b7280;
+  --color-gold: #d9b45b;
+  --color-golddeep: #ab8526;
+  --color-ok: #4ade80;
+  --color-warn: #fbbf24;
+  --color-bad: #f87171;
+  --color-info: #7dd3fc;
+}
+
+html { color-scheme: dark; }
+body {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ---------- Fondo animado: glows dorados + rejilla ---------- */
+.app-bg { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+.app-bg::before {
+  content: ''; position: absolute; inset: -60%;
+  background-image:
+    linear-gradient(rgba(217, 180, 91, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(217, 180, 91, 0.045) 1px, transparent 1px);
+  background-size: 38px 38px;
+  -webkit-mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 0%, transparent 72%);
+  mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 0%, transparent 72%);
+  animation: gridDrift 36s linear infinite;
+}
+.app-bg::after {
+  content: ''; position: absolute; inset: 0;
+  background:
+    radial-gradient(620px circle at 12% -8%, rgba(217, 180, 91, 0.11), transparent 60%),
+    radial-gradient(520px circle at 100% 8%, rgba(171, 133, 38, 0.09), transparent 55%),
+    radial-gradient(700px circle at 60% 108%, rgba(217, 180, 91, 0.05), transparent 60%);
+  animation: glowPulse 9s ease-in-out infinite alternate;
+}
+
+/* ---------- Keyframes ---------- */
+@keyframes gridDrift { from { transform: translateY(0); } to { transform: translateY(38px); } }
+@keyframes glowPulse { from { opacity: 0.65; } to { opacity: 1; } }
+@keyframes fadeInUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes barGrow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+@keyframes glowRing {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(217, 180, 91, 0.35); }
+  50% { box-shadow: 0 0 26px 3px rgba(217, 180, 91, 0.28); }
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulseSuave { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+/* ---------- Utilidades de animación ---------- */
+.animate-in { animation: fadeInUp 0.5s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.animate-fade { animation: fadeIn 0.6s ease both; }
+.spin { animation: spin 0.8s linear infinite; }
+.latido { animation: pulseSuave 1.6s ease-in-out infinite; }
+
+/* tarjetas: borde + glow dorado al pasar el ratón */
+.card-hover { transition: border-color 0.2s ease, box-shadow 0.25s ease, transform 0.2s ease; }
+.card-hover:hover { border-color: rgba(217, 180, 91, 0.32); box-shadow: 0 10px 34px -16px rgba(217, 180, 91, 0.4); }
+
+/* elementos que se elevan al hover */
+.lift { transition: transform 0.2s ease, box-shadow 0.25s ease, border-color 0.2s ease; }
+.lift:hover { transform: translateY(-3px); border-color: rgba(217, 180, 91, 0.4); box-shadow: 0 14px 40px -18px rgba(217, 180, 91, 0.5); }
+
+/* glow suave estático (logo, login) */
+.glow-gold { box-shadow: 0 0 30px -6px rgba(217, 180, 91, 0.5); animation: glowRing 4.5s ease-in-out infinite; }
+
+/* texto con degradado dorado */
+.text-gradient-gold {
+  background: linear-gradient(100deg, #f3d99b 0%, #d9b45b 45%, #ab8526 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+
+/* barras de gráficos que crecen desde la base */
+.bar { transform-box: fill-box; transform-origin: bottom; animation: barGrow 0.6s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* ---------- Formularios ---------- */
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(0.7); cursor: pointer; }
+select option { background: var(--color-card); color: var(--color-ink); }
+
+/* la vista previa de una plantilla se pinta en un iframe: fondo claro para
+   que el HTML del correo se vea como lo verá el destinatario */
+.vista-previa-correo { background: #ffffff; color: #111827; }
+
+/* ---------- Scrollbar ---------- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #26262f; border-radius: 8px; border: 2px solid var(--color-bg); }
+::-webkit-scrollbar-thumb:hover { background: #3a3a46; }
+
+::selection { background: rgba(217, 180, 91, 0.32); }
+
+/* ---------- Accesibilidad: respeta "reducir movimiento" ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

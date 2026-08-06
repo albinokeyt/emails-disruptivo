@@ -1,0 +1,62 @@
+# Autohospedaje y desarrollo local. En EasyPanel se crean los 3 servicios por separado (DEPLOY.md §A).
+# Copia .env.example a .env y rellena al menos ENCRYPTION_KEY, ADMIN_PASS y POSTGRES_PASSWORD.
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-emails}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-emails}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-emails}
+      REDIS_URL: redis://redis:6379
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?define ENCRYPTION_KEY en .env (openssl rand -base64 32)}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASS: ${ADMIN_PASS:?define ADMIN_PASS en .env}
+      ENVIO_LIMITE_MINUTO: ${ENVIO_LIMITE_MINUTO:-60}
+      ENVIO_LIMITE_DIA: ${ENVIO_LIMITE_DIA:-5000}
+      WORKER_HABILITADO: ${WORKER_HABILITADO:-true}
+      WORKER_CONCURRENCIA: ${WORKER_CONCURRENCIA:-5}
+      SMTP_RELAY_ENABLED: ${SMTP_RELAY_ENABLED:-false}
+      SMTP_RELAY_PORT: 2525
+      SMTP_RELAY_HOST: ${SMTP_RELAY_HOST:-localhost}
+      SMTP_RELAY_MAX_SIZE: ${SMTP_RELAY_MAX_SIZE:-26214400}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+      # el relay solo escucha si SMTP_RELAY_ENABLED=true; publicar el puerto de más no molesta
+      - "${SMTP_RELAY_PUBLIC_PORT:-2525}:2525"
+    restart: unless-stopped
+
+volumes:
+  dbdata:
+  redisdata:
