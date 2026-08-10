@@ -41,6 +41,31 @@ const RE_FECHA_HORA = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]
 const TXT_PREFIJO = 'disruptivo-verify='
 const TXT_SUBDOMINIO = '_disruptivo-verify'
 
+// Dominios de correo gratuito: no pertenecen a ninguna subcuenta, así que ni se verifican ni
+// bloquean a nadie. La pantalla de Dominios los enseña como «no aplica» y el alta los rechaza.
+// Además del listado exacto se cubren las variantes regionales (hotmail.fr, yahoo.co.uk,
+// outlook.com.br…): marca gratuita + sufijo público conocido. OJO: la marca sola no basta —
+// mail.<empresa>.com o web.<empresa>.de son subdominios corporativos legítimos y no deben caer aquí.
+const DOMINIOS_GRATUITOS = new Set([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com',
+  'icloud.com', 'me.com', 'aol.com', 'msn.com', 'proton.me', 'protonmail.com', 'gmx.com',
+  'yandex.com', 'zoho.com', 'mail.com', 'ymail.com', 'rocketmail.com', 'web.de', 't-online.de',
+  'laposte.net', 'libero.it', 'wanadoo.fr', 'orange.fr', 'free.fr', 'mail.ru', 'seznam.cz',
+])
+const MARCAS_GRATUITAS = new Set([
+  'gmail', 'googlemail', 'yahoo', 'ymail', 'hotmail', 'outlook', 'live', 'msn', 'icloud',
+  'aol', 'proton', 'protonmail', 'gmx', 'yandex', 'zoho',
+])
+// Sufijos bajo los que operan esas marcas: TLD simple (fr, de, it…) o compuesto (co.uk, com.br…)
+const RE_SUFIJO_PUBLICO = /^(?:[a-z]{2,3}|(?:co|com|net|org)\.[a-z]{2})$/
+export function esDominioGratuito(dominio) {
+  const d = String(dominio || '').toLowerCase()
+  if (DOMINIOS_GRATUITOS.has(d)) return true
+  const punto = d.indexOf('.')
+  if (punto <= 0) return false
+  return MARCAS_GRATUITAS.has(d.slice(0, punto)) && RE_SUFIJO_PUBLICO.test(d.slice(punto + 1))
+}
+
 // Host público de la app: es el destino del CNAME del dominio de tracking (SPEC §11.3)
 const hostApp = () => {
   try {
@@ -1266,36 +1291,81 @@ export default async function locationRoutes(app) {
     valor_txt: d.verify_token ? `${TXT_PREFIJO}${d.verify_token}` : null,
   })
 
+  // Además de las filas de sender_domains, se devuelven los dominios que la subcuenta usa de
+  // verdad en sus remitentes: la pantalla se construye a partir de ELLOS (sin campo libre), así
+  // que aquí viaja todo lo que necesita en una sola llamada.
   app.get('/api/loc/dominios', guard, async (req) => {
-    const { rows } = await q(
-      'SELECT * FROM sender_domains WHERE location_id=$1 ORDER BY verified DESC, domain',
-      [loc(req)]
-    )
-    return { dominios: rows.map(serializarDominio) }
+    const locationId = loc(req)
+    const [dominios, remitentes] = await Promise.all([
+      q('SELECT * FROM sender_domains WHERE location_id=$1 ORDER BY verified DESC, domain', [locationId]),
+      q(
+        `SELECT lower(split_part(email::text, '@', 2)) AS domain, COUNT(*)::int AS remitentes
+           FROM senders WHERE location_id=$1 GROUP BY 1 ORDER BY 1`,
+        [locationId]
+      ),
+    ])
+    return {
+      dominios: dominios.rows.map(serializarDominio),
+      dominios_remitentes: remitentes.rows.map((f) => ({
+        domain: f.domain,
+        remitentes: f.remitentes,
+        gratuito: esDominioGratuito(f.domain),
+      })),
+    }
   })
 
   app.post('/api/loc/dominios', guard, async (req, reply) => {
+    const locationId = loc(req)
     const b = req.body || {}
     let dominio = texto(b.dominio || b.domain).toLowerCase()
     dominio = dominio.replace(/^[a-z]+:\/\//, '').split('/')[0].split('@').pop().replace(/\.$/, '')
     if (!RE_DOMINIO.test(dominio)) return malo(reply, 'Ese dominio no es válido')
+    if (esDominioGratuito(dominio)) {
+      return malo(
+        reply,
+        'Los dominios de correo gratuito (Gmail, Outlook…) no se pueden verificar: no son de nadie en particular y tus envíos funcionan igual sin este paso'
+      )
+    }
+    // Solo dominios que la subcuenta usa de verdad: sin esto, cualquiera podía dar de alta el
+    // dominio de otro cliente «por si acaso» y llenar el sistema de reclamaciones que no le
+    // corresponden (nunca podría verificarlas sin el DNS, pero ni el ruido ni el intento se quieren).
+    const { rows: [mio] } = await q(
+      `SELECT 1 FROM senders WHERE location_id=$1 AND lower(split_part(email::text, '@', 2)) = $2 LIMIT 1`,
+      [locationId, dominio]
+    )
+    if (!mio) {
+      return malo(
+        reply,
+        'Solo puedes verificar dominios que ya uses en tus remitentes. Crea primero un remitente con un correo de ese dominio.'
+      )
+    }
 
     const { rows: [ajeno] } = await q(
       'SELECT 1 FROM sender_domains WHERE domain=$1 AND verified AND location_id<>$2',
-      [dominio, loc(req)]
+      [dominio, locationId]
     )
     if (ajeno) return reply.code(409).send({ error: 'Ese dominio ya está verificado por otra subcuenta' })
 
     try {
       const { rows: [d] } = await q(
         'INSERT INTO sender_domains (location_id, domain, verify_token) VALUES ($1,$2,$3) RETURNING *',
-        [loc(req), dominio, randomToken(16)]
+        [locationId, dominio, randomToken(16)]
       )
       return reply.code(201).send({ dominio: serializarDominio(d) })
     } catch (err) {
       if (err?.code === '23505') return reply.code(409).send({ error: 'Ese dominio ya está dado de alta' })
       throw err
     }
+  })
+
+  // Quitar un dominio solo renuncia a su exclusividad (deja de bloquear a otras subcuentas):
+  // no toca remitentes ni envíos, así que se permite incluso verificado.
+  app.delete('/api/loc/dominios/:id', guard, async (req, reply) => {
+    const id = idDe(req.params.id)
+    if (!id) return malo(reply, 'Identificador de dominio no válido')
+    const { rowCount } = await q('DELETE FROM sender_domains WHERE id=$1 AND location_id=$2', [id, loc(req)])
+    if (!rowCount) return reply.code(404).send({ error: 'Dominio no encontrado' })
+    return { ok: true }
   })
 
   app.post('/api/loc/dominios/:id/verificar', guard, async (req, reply) => {

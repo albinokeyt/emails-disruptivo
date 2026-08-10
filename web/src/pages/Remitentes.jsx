@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api } from '../api.js'
+import { api, esDominioGratuito } from '../api.js'
 import {
   Aviso,
   Badge,
@@ -21,7 +21,8 @@ const lista = (d, clave) => (Array.isArray(d) ? d : Array.isArray(d?.[clave]) ? 
 const CORREO = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
 
 // Los dominios de correo gratuito publican DMARC p=reject: enviar desde ellos es spoofing y rebota.
-const GRATUITOS = ['gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com', 'icloud.com', 'aol.com']
+// La detección vive en api.js (esDominioGratuito), espejo de la del backend: así este aviso y el
+// «no aplica» de la página Dominios hablan siempre del mismo conjunto de dominios.
 
 const ORIGEN = {
   panel: 'Alta manual',
@@ -279,19 +280,27 @@ export default function Remitentes() {
               autoComplete="off"
             />
 
-            {dominioForm && GRATUITOS.includes(dominioForm) && (
+            {dominioForm && esDominioGratuito(dominioForm) && (
               <Aviso variant="warn">
                 {dominioForm} bloquea el envío desde servicios externos (DMARC p=reject). Usa un dominio propio o el correo
                 rebotará.
               </Aviso>
             )}
-            {dominioForm && !GRATUITOS.includes(dominioForm) && !verificados.has(dominioForm) && (
+            {dominioForm && !esDominioGratuito(dominioForm) && !verificados.has(dominioForm) && (
               <Aviso variant="info">
-                El dominio {dominioForm} todavía no está verificado en esta app.{' '}
-                <Link to="/dominios" className="text-gold hover:underline">
-                  Verificarlo ahora
-                </Link>
-                .
+                {modal.id ? (
+                  <>
+                    El dominio {dominioForm} todavía no está verificado en esta app.{' '}
+                    <Link to="/dominios" className="text-gold hover:underline">
+                      Verificarlo ahora
+                    </Link>
+                    .
+                  </>
+                ) : (
+                  // en el alta el dominio aún no existe en la página Dominios (sale de los
+                  // remitentes GUARDADOS): enlazar ahí perdería este formulario a medias
+                  <>Cuando guardes este remitente podrás verificar el dominio {dominioForm} en la página Dominios (opcional).</>
+                )}
               </Aviso>
             )}
 

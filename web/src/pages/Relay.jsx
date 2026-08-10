@@ -115,6 +115,13 @@ export default function Relay() {
 
       {error && <Aviso variant="error">{error}</Aviso>}
 
+      {datos.servidor_activo === false && (
+        <Aviso variant="warn">
+          El servidor del relay está apagado ahora mismo a nivel de plataforma: si pegas estos datos en GHL te dará un
+          error de conexión. Escríbele a tu agencia para que lo active; tus datos seguirán siendo los mismos.
+        </Aviso>
+      )}
+
       {!activado ? (
         <div className={TARJETA}>
           <div className="text-sm font-semibold mb-2">Todavía no está activado</div>
@@ -248,9 +255,12 @@ export default function Relay() {
           <li className="flex gap-3">
             <span className="grid place-items-center w-5 h-5 rounded-full bg-gold/15 text-gold text-[11px] shrink-0">2</span>
             <span>
-              Elige el proveedor <strong className="text-ink">Other</strong> y pega ahí el servidor, el puerto, el usuario y
-              la contraseña que ves arriba. En «From Name» y «From Email» pon el remitente que uses habitualmente: da igual
-              cuál, luego puedes cambiarlo en cada correo.
+              En «Proveedor SMTP» elige <strong className="text-ink">Otro</strong> (Other). En{' '}
+              <strong className="text-ink">«Nombre del proveedor»</strong> pon lo que quieras — es solo la etiqueta con la
+              que lo verás en GHL (por ejemplo «Emails Disruptivo»). En{' '}
+              <strong className="text-ink">«Correo electrónico»</strong> pon un correo tuyo real (por ejemplo{' '}
+              <code className="text-ink">hola@tudominio.com</code>): será el remitente por defecto, y luego puedes
+              cambiarlo en cada correo. El servidor, el puerto, el usuario y la contraseña son los de arriba, tal cual.
             </span>
           </li>
           <li className="flex gap-3">
@@ -267,6 +277,12 @@ export default function Relay() {
             </span>
           </li>
         </ol>
+
+        <p className="text-[11px] text-mut mt-3">
+          Al guardar, GHL prueba la conexión con el servidor. Si te sale un error tipo{' '}
+          <code className="text-ink2">ETIMEDOUT</code> o «CONN», el servidor del relay no está accesible en ese momento:
+          no es nada que hayas escrito mal — avisa a tu agencia para que lo encienda.
+        </p>
 
         <div className="border-t border-border mt-5 pt-5">
           <div className="text-sm font-semibold mb-2">Lo importante: manda el remitente</div>

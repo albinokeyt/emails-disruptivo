@@ -129,9 +129,12 @@ export const urlExportarRebotados = (filtros) => `/api/loc/rebotados/exportar${c
 export const obtenerPreferencias = () => api.get('/api/loc/preferencias')
 export const guardarPreferencias = (datos) => api.patch('/api/loc/preferencias', datos)
 
+// GET devuelve { dominios, dominios_remitentes }: la pantalla se construye a partir de los
+// dominios que la subcuenta usa en sus remitentes, no de un campo libre.
 export const listarDominios = () => api.get('/api/loc/dominios')
 export const crearDominio = (datos) => api.post('/api/loc/dominios', datos)
 export const verificarDominio = (id) => api.post(`/api/loc/dominios/${id}/verificar`)
+export const eliminarDominio = (id) => api.del(`/api/loc/dominios/${id}`)
 
 // Dominio de tracking por subcuenta (SPEC §11.3): CNAME del cliente hacia el host de la app.
 // GET devuelve { dominios: [...], destino_cname } — como mucho hay un dominio por subcuenta.
@@ -214,6 +217,33 @@ export const fmtFechaHora = (v) =>
 
 export const fmtNumero = (v) =>
   v === null || v === undefined || v === '' ? '—' : new Intl.NumberFormat('es-ES').format(Number(v) || 0)
+
+/* ============================================================
+   Dominios de correo gratuito
+   ============================================================ */
+
+// Espejo de esDominioGratuito en src/routes/location.js (la fuente de verdad es el backend: el
+// flag `gratuito` de GET /api/loc/dominios sale de ahí). Este espejo existe solo para avisos en
+// vivo mientras se teclea un correo, sin llamar a la API. Si cambias uno, cambia el otro.
+const DOMINIOS_GRATUITOS = new Set([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com',
+  'icloud.com', 'me.com', 'aol.com', 'msn.com', 'proton.me', 'protonmail.com', 'gmx.com',
+  'yandex.com', 'zoho.com', 'mail.com', 'ymail.com', 'rocketmail.com', 'web.de', 't-online.de',
+  'laposte.net', 'libero.it', 'wanadoo.fr', 'orange.fr', 'free.fr', 'mail.ru', 'seznam.cz',
+])
+const MARCAS_GRATUITAS = new Set([
+  'gmail', 'googlemail', 'yahoo', 'ymail', 'hotmail', 'outlook', 'live', 'msn', 'icloud',
+  'aol', 'proton', 'protonmail', 'gmx', 'yandex', 'zoho',
+])
+const RE_SUFIJO_PUBLICO = /^(?:[a-z]{2,3}|(?:co|com|net|org)\.[a-z]{2})$/
+
+export function esDominioGratuito(dominio) {
+  const d = String(dominio || '').toLowerCase()
+  if (DOMINIOS_GRATUITOS.has(d)) return true
+  const punto = d.indexOf('.')
+  if (punto <= 0) return false
+  return MARCAS_GRATUITAS.has(d.slice(0, punto)) && RE_SUFIJO_PUBLICO.test(d.slice(punto + 1))
+}
 
 // "hace 3 min" para las columnas de actividad reciente.
 export function fmtRelativo(v) {

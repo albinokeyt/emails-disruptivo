@@ -184,11 +184,48 @@ export default function Subcuentas() {
               </Aviso>
             )}
 
+            {relay.datos.servidor_activo === false && (
+              <Aviso variant="error">
+                El servidor del relay está apagado (<code className="text-ink">SMTP_RELAY_ENABLED</code> no está en{' '}
+                <code className="text-ink">true</code>): si el cliente pega estos datos ahora, GHL dará un error de
+                conexión (ETIMEDOUT). Enciéndelo en EasyPanel antes de entregárselos.
+              </Aviso>
+            )}
+
             <div className="grid sm:grid-cols-2 gap-3">
               <Dato etiqueta="Servidor SMTP" valor={relay.datos.host || '—'} />
               <Dato etiqueta="Puerto" valor={relay.datos.port ?? '—'} />
               <Dato etiqueta="Usuario" valor={relay.datos.username || '—'} />
               {relay.password && <Dato etiqueta="Contraseña" valor={relay.password} />}
+            </div>
+
+            <div className="bg-card2 border border-border rounded-xl p-3.5">
+              <div className="text-[11px] text-mut uppercase tracking-wide mb-2">
+                Qué poner en cada campo del formulario de GHL
+              </div>
+              <ul className="text-xs text-ink2 space-y-1.5">
+                <li>
+                  <strong className="text-ink">Proveedor SMTP:</strong> «Otro» (Other).
+                </li>
+                <li>
+                  <strong className="text-ink">Nombre del proveedor:</strong> el que quiera el cliente — es solo la
+                  etiqueta con la que lo verá en GHL (por ejemplo «Emails Disruptivo»).
+                </li>
+                <li>
+                  <strong className="text-ink">Correo electrónico:</strong> un correo real del cliente (por ejemplo{' '}
+                  <code className="text-ink">hola@su-dominio.com</code>): será el remitente por defecto de lo que envíe
+                  por aquí.
+                </li>
+                <li>
+                  <strong className="text-ink">Servidor, puerto, usuario y contraseña:</strong> los de arriba, tal cual.
+                </li>
+              </ul>
+              <p className="text-[11px] text-mut mt-2.5">
+                Recuerda: el flag de arriba solo indica si el proceso está encendido — nadie comprueba el puerto. El
+                puerto <code className="text-ink2">{relay.datos.port ?? 2525}</code> tiene que estar publicado como{' '}
+                <strong className="text-ink2">TCP</strong> en EasyPanel (sección <em>Ports</em>; los <em>Domains</em> de
+                Traefik no enrutan SMTP). Si GHL da ETIMEDOUT al guardar, revisa eso primero (DEPLOY.md, sección D).
+              </p>
             </div>
 
             <p className="text-xs text-ink2">

@@ -3,6 +3,7 @@ import { redis } from '../redis.js'
 import { q } from '../db.js'
 import { decryptGhlSso, ssoAuthorized, normalizarIdentidadSso } from './sso.js'
 import { getGhlConfig, getAdmins } from './settings.js'
+import { fetchLocationName } from './ghl.js'
 
 // Dos sesiones INDEPENDIENTES, con cookie propia cada una:
 //   ed_admin → panel de la agencia (/admin/*). SameSite=Lax salvo que nazca dentro del iframe.
@@ -85,6 +86,43 @@ export const getSesionLocation = async (req) => {
 
 export const destruirSesionLocation = (req, reply) => borrarSesion(req, reply, COOKIE_LOC)
 
+// El callback de OAuth guarda el nombre de la subcuenta al instalar, pero si aquella llamada falló
+// (o la fila nació de un SSO sin instalación OAuth) la conexión se queda sin nombre para siempre y
+// el panel enseña «Sin nombre». Este auto-reparado lo reintenta al iniciar sesión: como el nombre es
+// cosmético, se espera como mucho 5 s — si GHL tarda más, la promesa pendiente lo deja guardado
+// igualmente y la PRÓXIMA entrada ya lo enseña. Un fallo se apunta en Redis 10 minutos para que una
+// subcuenta cuyo nombre no se puede resolver (sin token, GHL caído…) no pague la espera en cada
+// handshake indefinidamente.
+const ESPERA_NOMBRE_MS = 5_000
+const REINTENTO_NOMBRE_S = 600
+async function recuperarNombreConexion(connectionId, locationId) {
+  const claveFallo = `locname:fallo:${connectionId}`
+  try {
+    if (await redis.get(claveFallo)) return null
+  } catch {
+    /* sin Redis se intenta igual: el timeout de abajo sigue acotando la espera */
+  }
+  try {
+    const intento = fetchLocationName(connectionId, locationId)
+      .then(async (n) => {
+        const nombre = String(n || '').trim().slice(0, 200)
+        if (!nombre) return null
+        // COALESCE por si otra petición simultánea (u OAuth) ya lo escribió: no se pisa
+        await q(
+          `UPDATE connections SET name = COALESCE(name, $1), updated_at = now() WHERE id = $2`,
+          [nombre, connectionId]
+        )
+        return nombre
+      })
+      .catch(() => null)
+    const nombre = await Promise.race([intento, new Promise((r) => setTimeout(r, ESPERA_NOMBRE_MS, null))])
+    if (!nombre) await redis.set(claveFallo, '1', 'EX', REINTENTO_NOMBRE_S).catch(() => {})
+    return nombre
+  } catch {
+    return null
+  }
+}
+
 /**
  * Canjea el payload cifrado que GHL entrega al iframe (postMessage REQUEST_USER_DATA) por las
  * sesiones que correspondan. Es el ÚNICO sitio de toda la app donde nace un location_id de sesión:
@@ -127,14 +165,15 @@ export async function iniciarSesionSso(req, reply, payloadCifrado) {
   }
 
   const { rows: [conn] } = await q(
-    'SELECT name, status FROM connections WHERE location_id=$1',
+    'SELECT id, name, status FROM connections WHERE location_id=$1',
     [id.locationId]
   )
   if (conn?.status === 'uninstalled') {
     throw errorHttp(403, 'La app ya no está instalada en esta subcuenta. Vuelve a instalarla para continuar.')
   }
 
-  const nombre = conn?.name || null
+  let nombre = conn?.name || null
+  if (!nombre && conn?.id) nombre = await recuperarNombreConexion(conn.id, id.locationId)
   await crearSesionLocation(req, reply, {
     locationId: id.locationId,
     nombre,

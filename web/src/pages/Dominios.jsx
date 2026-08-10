@@ -1,9 +1,13 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
-  api,
+  crearDominio,
   crearDominioTracking,
+  eliminarDominio,
   eliminarDominioTracking,
+  listarDominios,
   listarDominiosTracking,
+  verificarDominio,
   verificarDominioTracking,
 } from '../api.js'
 import { Aviso, Boton, Campo, Confirmar, Copiar, Spinner, Tabla } from '../components/ui.jsx'
@@ -16,8 +20,6 @@ const fecha = (d) => (d ? new Date(d).toLocaleString('es-ES', { day: '2-digit', 
 
 const DOMINIO = /^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$/
 
-const GRATUITOS = ['gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com', 'icloud.com', 'aol.com']
-
 // El nombre y el valor del TXT los monta el backend (location.js → serializarDominio) y son los
 // mismos que comprueba /verificar. Reconstruirlos aquí haría que el panel pidiera publicar un
 // registro que el verificador nunca busca, y el dominio no se validaría jamás.
@@ -25,14 +27,76 @@ const SUBDOMINIO_TXT = '_disruptivo-verify'
 const nombreTxt = (d) => d?.registro_txt || `${SUBDOMINIO_TXT}.${d?.domain}`
 const valorTxt = (d) => d?.valor_txt || (d?.verify_token ? `disruptivo-verify=${d.verify_token}` : '')
 
+function Chip({ tono, children }) {
+  const clases = {
+    ok: 'border-ok/40 text-ok bg-ok/10',
+    warn: 'border-warn/40 text-warn bg-warn/10',
+    mut: 'border-border text-mut bg-card2',
+  }
+  return <span className={`text-[11px] px-2 py-0.5 rounded-full border whitespace-nowrap ${clases[tono]}`}>{children}</span>
+}
+
+// Guía en 3 pasos para publicar el TXT, en cristiano y con botones de copiar.
+function PasosTxt({ dominio }) {
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <ol className="space-y-2.5 text-sm text-ink2 mb-4">
+        <li className="flex gap-3">
+          <span className="grid place-items-center w-5 h-5 rounded-full bg-gold/15 text-gold text-[11px] shrink-0">1</span>
+          <span>
+            Entra donde gestionas <strong className="text-ink">{dominio.domain}</strong> (GoDaddy, Cloudflare, IONOS,
+            Hostinger…) y busca el apartado <strong className="text-ink">DNS</strong>.
+          </span>
+        </li>
+        <li className="flex gap-3">
+          <span className="grid place-items-center w-5 h-5 rounded-full bg-gold/15 text-gold text-[11px] shrink-0">2</span>
+          <span>
+            Crea un registro nuevo de tipo <strong className="text-ink">TXT</strong> con este nombre y este valor
+            (cópialos con los botones):
+          </span>
+        </li>
+      </ol>
+      <Tabla columnas={['Tipo', 'Nombre', 'Valor']}>
+        <tr>
+          <td className="px-3 py-2.5 text-sm border-t border-border/60 font-mono">TXT</td>
+          <td className="px-3 py-2.5 text-sm border-t border-border/60 font-mono break-all">
+            <span className="inline-flex items-center gap-2">
+              {nombreTxt(dominio)}
+              <Copiar value={nombreTxt(dominio)} />
+            </span>
+          </td>
+          <td className="px-3 py-2.5 text-sm border-t border-border/60 font-mono break-all">
+            <span className="inline-flex items-center gap-2">
+              {valorTxt(dominio)}
+              <Copiar value={valorTxt(dominio)} />
+            </span>
+          </td>
+        </tr>
+      </Tabla>
+      <p className="text-[11px] text-mut mt-2">
+        Si tu proveedor de DNS añade el dominio solo, escribe únicamente <code className="text-ink2">{SUBDOMINIO_TXT}</code>{' '}
+        en el campo «Nombre».
+      </p>
+      <ol className="space-y-2.5 text-sm text-ink2 mt-3" start={3}>
+        <li className="flex gap-3">
+          <span className="grid place-items-center w-5 h-5 rounded-full bg-gold/15 text-gold text-[11px] shrink-0">3</span>
+          <span>
+            Vuelve aquí y pulsa <strong className="text-ink">«Comprobar ahora»</strong>. Los DNS pueden tardar desde unos
+            minutos hasta unas horas en propagarse: si no sale a la primera, prueba más tarde.
+          </span>
+        </li>
+      </ol>
+    </div>
+  )
+}
+
 export default function Dominios() {
-  const [datos, setDatos] = useState(null)
+  const [datos, setDatos] = useState(null) // { dominios: [], remitentes: [] }
   const [error, setError] = useState('')
-  const [nuevo, setNuevo] = useState('')
-  const [errorAlta, setErrorAlta] = useState('')
-  const [creando, setCreando] = useState(false)
-  const [verificando, setVerificando] = useState(null)
-  const [resultado, setResultado] = useState(null) // {id, ok, detalle}
+  const [aviso, setAviso] = useState(null) // { ok, detalle }
+  const [ocupado, setOcupado] = useState(null) // domain o id en curso
+  const [aBorrar, setABorrar] = useState(null) // fila de sender_domains a confirmar
+  const [borrando, setBorrando] = useState(false)
 
   // Dominio de tracking (SPEC §11.3): como mucho uno por subcuenta
   const [tracking, setTracking] = useState(null) // { dominios: [], destino: '' }
@@ -46,12 +110,12 @@ export default function Dominios() {
 
   const cargar = useCallback(async () => {
     try {
-      const d = await api.get('/api/loc/dominios')
-      setDatos(lista(d, 'dominios'))
+      const d = await listarDominios()
+      setDatos({ dominios: lista(d, 'dominios'), remitentes: lista(d?.dominios_remitentes, 'dominios_remitentes') })
       setError('')
     } catch (e) {
       setError(e.message)
-      setDatos([])
+      setDatos({ dominios: [], remitentes: [] })
     }
   }, [])
 
@@ -71,6 +135,61 @@ export default function Dominios() {
     cargarTracking()
   }, [cargar, cargarTracking])
 
+  // La pantalla se monta desde los dominios de los remitentes: nada de campos libres.
+  const filas = useMemo(() => {
+    if (!datos) return { propios: [], huerfanos: [] }
+    const porDominio = new Map(datos.dominios.map((d) => [d.domain, d]))
+    const propios = datos.remitentes.map((r) => ({ ...r, registro: porDominio.get(r.domain) || null }))
+    const conRemitente = new Set(datos.remitentes.map((r) => r.domain))
+    const huerfanos = datos.dominios.filter((d) => !conRemitente.has(d.domain))
+    return { propios, huerfanos }
+  }, [datos])
+
+  const proteger = async (domain) => {
+    setOcupado(domain)
+    setAviso(null)
+    try {
+      await crearDominio({ domain })
+      await cargar()
+    } catch (err) {
+      setAviso({ ok: false, detalle: err.message })
+    } finally {
+      setOcupado(null)
+    }
+  }
+
+  const comprobar = async (d) => {
+    setOcupado(d.id)
+    setAviso(null)
+    try {
+      // el backend solo responde 200 cuando verifica (el TXT ausente llega como 409 → ErrorApi,
+      // con el mensaje detallado del servidor en err.message)
+      await verificarDominio(d.id)
+      setAviso({ ok: true, detalle: `${d.domain} verificado: ya es tuyo y ninguna otra subcuenta puede usarlo.` })
+      await cargar()
+    } catch (err) {
+      setAviso({ ok: false, detalle: err.message })
+    } finally {
+      setOcupado(null)
+    }
+  }
+
+  const quitar = async () => {
+    if (!aBorrar) return
+    setBorrando(true)
+    try {
+      await eliminarDominio(aBorrar.id)
+      setABorrar(null)
+      setAviso(null)
+      await cargar()
+    } catch (err) {
+      setAviso({ ok: false, detalle: err.message })
+      setABorrar(null)
+    } finally {
+      setBorrando(false)
+    }
+  }
+
   const dtrack = tracking?.dominios?.[0] || null
   const destinoCname = dtrack?.destino_cname || tracking?.destino || ''
 
@@ -78,7 +197,7 @@ export default function Dominios() {
     e.preventDefault()
     const dominio = nuevoTracking.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '')
     if (!DOMINIO.test(dominio)) {
-      setErrorTracking('Escribe un dominio válido, por ejemplo link.tudominio.com (sin http:// ni barras).')
+      setErrorTracking('Escribe un subdominio válido, por ejemplo link.tudominio.com (sin http:// ni barras).')
       return
     }
     setErrorTracking('')
@@ -99,13 +218,11 @@ export default function Dominios() {
     setVerificandoTracking(true)
     setResultadoTracking(null)
     try {
-      const r = await verificarDominioTracking(d.id)
-      const ok = r?.verificado ?? r?.ok ?? false
+      // igual que en comprobar(): un 200 siempre es verificado; los fallos llegan como 409 al catch
+      await verificarDominioTracking(d.id)
       setResultadoTracking({
-        ok,
-        detalle: ok
-          ? `${d.domain} verificado: los enlaces y el pixel de tus correos ya salen por tu dominio.`
-          : r?.detalle || r?.error || 'Todavía no se ve el CNAME. Los DNS pueden tardar unos minutos.',
+        ok: true,
+        detalle: `${d.domain} verificado: los enlaces y el pixel de tus correos ya salen por tu dominio.`,
       })
       await cargarTracking()
     } catch (err) {
@@ -134,52 +251,6 @@ export default function Dominios() {
     }
   }
 
-  const anadir = async (e) => {
-    e.preventDefault()
-    const dominio = nuevo.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '')
-    if (!DOMINIO.test(dominio)) {
-      setErrorAlta('Escribe un dominio válido, por ejemplo tudominio.com (sin http:// ni barras).')
-      return
-    }
-    if (GRATUITOS.includes(dominio)) {
-      setErrorAlta('No se puede verificar un dominio de correo gratuito: usa un dominio propio.')
-      return
-    }
-    setErrorAlta('')
-    setCreando(true)
-    try {
-      await api.post('/api/loc/dominios', { domain: dominio })
-      setNuevo('')
-      await cargar()
-    } catch (err) {
-      setErrorAlta(err.message)
-    } finally {
-      setCreando(false)
-    }
-  }
-
-  const verificar = async (d) => {
-    setVerificando(d.id)
-    setResultado(null)
-    try {
-      const r = await api.post(`/api/loc/dominios/${d.id}/verificar`)
-      // el backend responde {ok, verificado, detalle} (location.js): «verified» no existe ahí
-      const ok = r?.verificado ?? r?.verified ?? r?.ok ?? false
-      setResultado({
-        id: d.id,
-        ok,
-        detalle: ok
-          ? `${d.domain} verificado correctamente.`
-          : r?.detalle || r?.error || 'Todavía no se ve el registro TXT. Los DNS pueden tardar unos minutos.',
-      })
-      await cargar()
-    } catch (err) {
-      setResultado({ id: d.id, ok: false, detalle: err.message })
-    } finally {
-      setVerificando(null)
-    }
-  }
-
   if (datos === null) {
     return (
       <div className="py-16 grid place-items-center">
@@ -193,106 +264,124 @@ export default function Dominios() {
       <div>
         <h1 className="text-xl font-bold">Dominios</h1>
         <p className="text-sm text-ink2 mt-1">
-          Demuestra que un dominio es tuyo para poder enviar desde él. Es lo que impide que otra subcuenta use tus
-          direcciones.
+          Estos son los dominios de tus remitentes: no tienes que escribir nada, aparecen aquí solos. Verificar un
+          dominio es <strong className="text-ink">opcional</strong> (tus correos salen igual sin hacerlo), pero al
+          verificarlo queda registrado como tuyo y ninguna otra subcuenta podrá enviar con direcciones de ese dominio.
         </p>
       </div>
 
       {error && <Aviso variant="error">{error}</Aviso>}
-      {resultado && <Aviso variant={resultado.ok ? 'ok' : 'warn'}>{resultado.detalle}</Aviso>}
+      {aviso && <Aviso variant={aviso.ok ? 'ok' : 'warn'}>{aviso.detalle}</Aviso>}
 
-      <form onSubmit={anadir} className={TARJETA}>
-        <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
-          <Campo
-            className="flex-1"
-            label="Añadir dominio"
-            placeholder="tudominio.com"
-            value={nuevo}
-            onChange={(e) => setNuevo(e.target.value)}
-            autoComplete="off"
-          />
-          <Boton type="submit" disabled={creando}>
-            {creando ? 'Añadiendo…' : 'Añadir'}
-          </Boton>
-        </div>
-        {errorAlta && (
-          <div className="mt-3">
-            <Aviso variant="error">{errorAlta}</Aviso>
-          </div>
-        )}
-      </form>
-
-      {datos.length === 0 ? (
+      {filas.propios.length === 0 && filas.huerfanos.length === 0 ? (
         <div className={TARJETA}>
-          <p className="text-sm text-mut py-10 text-center">
-            Todavía no has añadido ningún dominio. Añade el dominio de tus remitentes para verificarlo.
+          <p className="text-sm text-mut py-8 text-center">
+            Aquí no hay nada que hacer todavía. Cuando crees tu primer remitente en{' '}
+            <Link to="/remitentes" className="text-gold hover:underline">
+              Remitentes
+            </Link>
+            , su dominio aparecerá aquí solo.
           </p>
         </div>
       ) : (
         <div className="space-y-4">
-          {datos.map((d) => (
-            <div key={d.id} className={TARJETA}>
-              <div className="flex items-center justify-between gap-4 flex-wrap">
-                <div>
-                  <div className="font-semibold">{d.domain}</div>
-                  <div className="text-[11px] text-mut">
-                    {d.verified ? `Verificado el ${fecha(d.verified_at)}` : `Añadido el ${fecha(d.created_at)}`}
+          {filas.propios.map((f) => {
+            const d = f.registro
+            return (
+              <div key={f.domain} className={TARJETA}>
+                <div className="flex items-center justify-between gap-4 flex-wrap">
+                  <div>
+                    <div className="font-semibold">{f.domain}</div>
+                    <div className="text-[11px] text-mut">
+                      {f.remitentes === 1 ? '1 remitente' : `${f.remitentes} remitentes`}
+                      {d?.verified ? ` · verificado el ${fecha(d.verified_at)}` : ''}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {f.gratuito ? (
+                      <Chip tono="mut">Correo gratuito · no aplica</Chip>
+                    ) : d?.verified ? (
+                      <Chip tono="ok">Verificado · es tuyo</Chip>
+                    ) : d ? (
+                      <Chip tono="warn">Falta el registro DNS</Chip>
+                    ) : (
+                      <Chip tono="mut">Sin verificar</Chip>
+                    )}
+                    {!f.gratuito && d && !d.verified && (
+                      <Boton variant="ghost" disabled={ocupado === d.id} onClick={() => comprobar(d)}>
+                        {ocupado === d.id ? 'Comprobando…' : 'Comprobar ahora'}
+                      </Boton>
+                    )}
+                    {!f.gratuito && !d && (
+                      <Boton disabled={ocupado === f.domain} onClick={() => proteger(f.domain)}>
+                        {ocupado === f.domain ? 'Preparando…' : 'Verificar este dominio'}
+                      </Boton>
+                    )}
+                    {d && (
+                      <Boton variant="ghost" onClick={() => setABorrar(d)}>
+                        Quitar
+                      </Boton>
+                    )}
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <span
-                    className={`text-[11px] px-2 py-0.5 rounded-full border ${
-                      d.verified ? 'border-ok/40 text-ok bg-ok/10' : 'border-warn/40 text-warn bg-warn/10'
-                    }`}
-                  >
-                    {d.verified ? 'Verificado' : 'Pendiente'}
-                  </span>
-                  {!d.verified && (
-                    <Boton variant="ghost" disabled={verificando === d.id} onClick={() => verificar(d)}>
-                      {verificando === d.id ? 'Comprobando…' : 'Comprobar ahora'}
-                    </Boton>
-                  )}
-                </div>
-              </div>
 
-              {!d.verified && valorTxt(d) && (
-                <div className="mt-4 border-t border-border pt-4">
-                  <p className="text-sm text-ink2 mb-3">
-                    Publica este registro TXT en el DNS de <strong className="text-ink">{d.domain}</strong> y pulsa
-                    «Comprobar ahora». Suele tardar entre unos minutos y una hora en propagarse.
-                  </p>
-                  <Tabla columnas={['Tipo', 'Nombre', 'Valor', '']}>
-                    <tr>
-                      <td className="px-3 py-2.5 text-sm border-t border-border/60 font-mono">TXT</td>
-                      <td className="px-3 py-2.5 text-sm border-t border-border/60 font-mono break-all">
-                        {nombreTxt(d)}
-                      </td>
-                      <td className="px-3 py-2.5 text-sm border-t border-border/60 font-mono break-all">
-                        {valorTxt(d)}
-                      </td>
-                      <td className="px-3 py-2.5 text-sm border-t border-border/60 text-right whitespace-nowrap">
-                        <Copiar value={valorTxt(d)} />
-                      </td>
-                    </tr>
-                  </Tabla>
+                {f.gratuito && (
                   <p className="text-[11px] text-mut mt-2">
-                    Si tu proveedor de DNS añade el dominio solo, escribe únicamente{' '}
-                    <code className="text-ink2">{SUBDOMINIO_TXT}</code> en el campo «Nombre».
+                    Los dominios como Gmail, Outlook o Yahoo no son de nadie en particular, así que no se pueden
+                    verificar. No pasa nada: tus envíos funcionan igual.
                   </p>
-                </div>
-              )}
+                )}
+
+                {!f.gratuito && !d && (
+                  <p className="text-[11px] text-mut mt-2">
+                    Al pulsar «Verificar este dominio» te damos un pequeño registro para pegar en tu DNS. Es la manera de
+                    demostrar que el dominio es tuyo.
+                  </p>
+                )}
+
+                {!f.gratuito && d && !d.verified && valorTxt(d) && <PasosTxt dominio={d} />}
+              </div>
+            )
+          })}
+
+          {filas.huerfanos.length > 0 && (
+            <div className={TARJETA}>
+              <div className="text-sm font-semibold mb-1">Dominios sin remitente</div>
+              <p className="text-[11px] text-mut mb-3">
+                Se añadieron en su día pero ya no corresponden a ningún remitente tuyo. Los que están sin verificar
+                puedes quitarlos sin miedo; uno verificado sigue reservando el dominio para ti mientras exista.
+              </p>
+              <div className="space-y-2">
+                {filas.huerfanos.map((d) => (
+                  <div
+                    key={d.id}
+                    className="flex items-center justify-between gap-3 bg-card2 border border-border rounded-xl px-3.5 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <span className="text-sm text-ink break-all">{d.domain}</span>
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0">
+                      {d.verified ? <Chip tono="ok">Verificado</Chip> : <Chip tono="mut">Sin verificar</Chip>}
+                      <Boton variant="ghost" onClick={() => setABorrar({ ...d, huerfano: true })}>
+                        Quitar
+                      </Boton>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
-          ))}
+          )}
         </div>
       )}
 
       <div className={TARJETA}>
-        <div className="text-sm font-semibold mb-2">Por qué hace falta</div>
+        <div className="text-sm font-semibold mb-2">Para qué sirve esto</div>
         <p className="text-sm text-ink2">
-          Un dominio verificado pertenece a una sola subcuenta. Con eso, el relay puede rechazar cualquier intento de
-          enviar desde tus direcciones desde otra cuenta. Verificar el dominio aquí no sustituye a la configuración de
-          entregabilidad: para que el correo llegue a la bandeja de entrada necesitas además SPF, DKIM y DMARC publicados,
-          y el dominio dado de alta en tu proveedor de envío.
+          Al verificar un dominio demuestras que es tuyo, y a partir de ahí ninguna otra subcuenta de esta plataforma
+          puede enviar correos con direcciones de ese dominio: nadie puede hacerse pasar por ti. Solo puedes verificar
+          dominios que ya uses en tus remitentes, y la verificación exige tocar el DNS del dominio — por eso nadie puede
+          «reclamar» un dominio que no controla. Ojo: esto no sustituye a la entregabilidad (SPF, DKIM y DMARC van en tu
+          proveedor de envío, como siempre).
         </p>
       </div>
 
@@ -300,10 +389,11 @@ export default function Dominios() {
           Dominio de tracking (SPEC §11.3): CNAME del cliente → host de la app
           ------------------------------------------------------------------ */}
       <div className="pt-2">
-        <h2 className="text-lg font-bold">Dominio de tracking</h2>
+        <h2 className="text-lg font-bold">Enlaces con tu marca (opcional)</h2>
         <p className="text-sm text-ink2 mt-1">
-          Haz que el pixel de apertura y los enlaces medidos de tus correos salgan por un subdominio tuyo en vez del
-          dominio compartido de la app.
+          Los enlaces y el pixel de apertura de tus correos usan el dominio de la app. Si prefieres que lleven tu marca,
+          apunta aquí un subdominio tuyo (por ejemplo <code className="text-ink2">link.tudominio.com</code>): mejora la
+          imagen de tus correos y la reputación pasa a ser solo tuya.
         </p>
       </div>
 
@@ -321,7 +411,7 @@ export default function Dominios() {
           <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
             <Campo
               className="flex-1"
-              label="Añadir dominio de tracking"
+              label="Subdominio para tus enlaces"
               placeholder="link.tudominio.com"
               value={nuevoTracking}
               onChange={(e) => setNuevoTracking(e.target.value)}
@@ -334,7 +424,7 @@ export default function Dominios() {
           <p className="text-[11px] text-mut mt-2">
             Usa un subdominio dedicado (por ejemplo <code className="text-ink2">link.</code> o{' '}
             <code className="text-ink2">click.</code>) que no tenga ya otros registros DNS. Solo puede haber un dominio
-            de tracking por subcuenta.
+            de tracking por subcuenta, y quitarlo después no rompe nada.
           </p>
         </form>
       ) : (
@@ -349,13 +439,7 @@ export default function Dominios() {
               </div>
             </div>
             <div className="flex items-center gap-3">
-              <span
-                className={`text-[11px] px-2 py-0.5 rounded-full border ${
-                  dtrack.verified ? 'border-ok/40 text-ok bg-ok/10' : 'border-warn/40 text-warn bg-warn/10'
-                }`}
-              >
-                {dtrack.verified ? 'Verificado' : 'Pendiente'}
-              </span>
+              {dtrack.verified ? <Chip tono="ok">Verificado</Chip> : <Chip tono="warn">Falta el registro DNS</Chip>}
               {!dtrack.verified && (
                 <Boton variant="ghost" disabled={verificandoTracking} onClick={() => verificarTracking(dtrack)}>
                   {verificandoTracking ? 'Comprobando…' : 'Comprobar ahora'}
@@ -370,7 +454,7 @@ export default function Dominios() {
           {!dtrack.verified && (
             <div className="mt-4 border-t border-border pt-4">
               <p className="text-sm text-ink2 mb-3">
-                Crea estos dos registros en el DNS de tu dominio y pulsa «Comprobar ahora». El CNAME dirige los enlaces
+                En el DNS de tu dominio crea estos dos registros y pulsa «Comprobar ahora». El CNAME dirige los enlaces
                 y el TXT demuestra que el dominio es tuyo. Suelen tardar entre unos minutos y una hora en propagarse.
               </p>
               <Tabla columnas={['Tipo', 'Nombre', 'Valor', '']}>
@@ -416,15 +500,23 @@ export default function Dominios() {
         </div>
       )}
 
-      <div className={TARJETA}>
-        <div className="text-sm font-semibold mb-2">Por qué conviene</div>
-        <p className="text-sm text-ink2">
-          Sin dominio propio, los enlaces de todos los correos comparten el dominio de la app entre todas las
-          subcuentas, y la reputación de unos arrastra a los demás. Con el CNAME verificado, los enlaces y el pixel de
-          tus correos llevan tu dominio: la reputación pasa a ser tuya y los filtros de spam ven un enlace alineado con
-          tu marca. Activarlo o quitarlo no rompe nada de lo ya enviado.
-        </p>
-      </div>
+      {aBorrar && (
+        <Confirmar
+          titulo="Quitar dominio"
+          mensaje={
+            aBorrar.verified
+              ? `${aBorrar.domain} dejará de estar registrado como tuyo: cualquier otra subcuenta podría verificarlo a partir de ahora. Tus remitentes y envíos no se tocan.`
+              : aBorrar.huerfano
+                ? `Se quita ${aBorrar.domain} de la lista. Para volver a añadirlo tendrías que crear antes un remitente con un correo de ese dominio.`
+                : `Se quita ${aBorrar.domain} de la lista. Puedes volver a añadirlo cuando quieras con el botón «Verificar este dominio».`
+          }
+          peligro={Boolean(aBorrar.verified)}
+          ocupado={borrando}
+          textoConfirmar="Quitar"
+          onConfirmar={quitar}
+          onCancelar={() => setABorrar(null)}
+        />
+      )}
 
       {borrarTracking && (
         <Confirmar

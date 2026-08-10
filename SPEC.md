@@ -199,11 +199,11 @@ Errores: `{ "error": "mensaje en español" }` con el código HTTP adecuado.
 | GET | `/api/loc/envios` | filtros `estado`, `desde`, `hasta`, `q`, `origen`; paginado |
 | GET | `/api/loc/envios/:id` | mensaje + su `message_events` |
 | GET/POST/DELETE | `/api/loc/supresiones[/:id]` | alta y baja manual |
-| GET/POST | `/api/loc/dominios` | alta de dominio + token DNS; `POST /:id/verificar` comprueba el TXT |
-| GET | `/api/loc/relay` | `{enabled, host, port, username, tiene_password, default_provider_id, accept_unknown_senders}` |
+| GET/POST/DELETE | `/api/loc/dominios[/:id]` | GET incluye `dominios_remitentes` (dominios reales de los remitentes, con `gratuito`); el POST solo admite dominios presentes en los remitentes de la subcuenta (y nunca de correo gratuito); `POST /:id/verificar` comprueba el TXT; DELETE renuncia a la exclusividad |
+| GET | `/api/loc/relay` | `{enabled, host, port, username, tiene_password, default_provider_id, accept_unknown_senders, servidor_activo, last_used_at, rotated_at}` — `servidor_activo` refleja `SMTP_RELAY_ENABLED` (solo el flag: NO comprueba que el puerto TCP esté publicado); el panel avisa cuando es `false` |
 | POST | `/api/loc/relay/activar` | activa la sección y genera credenciales; devuelve la contraseña **una sola vez** |
 | POST | `/api/loc/relay/rotar` | regenera la contraseña; devuelve la nueva **una sola vez** |
-| PATCH | `/api/loc/relay` | `{enabled, default_provider_id, accept_unknown_senders}` |
+| PATCH | `/api/loc/relay` | `{enabled, default_provider_id, accept_unknown_senders}`; responde como el GET |
 
 ### 5.3 Panel de admin — `src/routes/admin.js` (todas con `requireAdmin`)
 | Método | Ruta | Notas |
@@ -216,7 +216,7 @@ Errores: `{ "error": "mensaje en español" }` con el código HTTP adecuado.
 | GET/POST/PATCH/DELETE | `/api/admin/remitentes[/:id]` | con `location_id` obligatorio en POST |
 | GET/POST/PATCH/DELETE | `/api/admin/plantillas[/:id]` | `location_id` null = global |
 | GET | `/api/admin/envios` | vista global con filtro por subcuenta |
-| POST | `/api/admin/subcuentas/:locationId/relay` | activa el relay a una subcuenta y devuelve sus datos |
+| POST | `/api/admin/subcuentas/:locationId/relay` | activa el relay a una subcuenta y devuelve sus datos (misma forma que `GET /api/loc/relay`, incluido `servidor_activo`; contraseña en `contrasena` **una sola vez**) |
 | GET/PUT | `/api/admin/ajustes` | credenciales GHL, shared secret, límites (secretos enmascarados al leer) |
 
 ### 5.4 Nodos de GHL — `src/routes/actions.js`
@@ -348,7 +348,9 @@ botón *Probar conexión*, sección de proveedores cedidos por el admin en solo 
 `Envios` (tabla con filtros y detalle con el histórico de eventos) ·
 `Relay` (interruptor de activación, datos SMTP para pegar en GHL con botón de copiar, contraseña
 visible una sola vez, proveedor por defecto y explicación del enrutado por remitente) ·
-`Dominios` (alta, TXT a publicar, botón de verificar).
+`Dominios` (sin campo libre: la lista sale de los dominios de los remitentes — `dominios_remitentes`
+del GET —, con estado por dominio [gratuito «no aplica» / sin verificar / pendiente con guía TXT en
+3 pasos / verificado], botón de verificar/comprobar/quitar y sección de huérfanos sin remitente).
 
 **Admin:** `Login` · `Subcuentas` · `ProveedoresAdmin` · `Asignaciones` · `RemitentesAdmin` ·
 `PlantillasAdmin` · `EnviosAdmin` · `Ajustes`.
