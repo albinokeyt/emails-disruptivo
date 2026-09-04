@@ -28,7 +28,7 @@ agencia, se los cede a las subcuentas que quiera, y crea remitentes y plantillas
  (2) Nodo «Enviar email personalizado» ──POST──▶  /api/ghl/accion/personalizado/:secr ─┤
      asunto, preheader, CC/BCC, HTML a mano                                            │
                                                                                        │
- (3) Nodo NATIVO de email de GHL       ──SMTP──▶  relay :2525  (AUTH ▸ From ▸ sender) ─┤
+ (3) Nodo NATIVO de email de GHL       ──SMTP─▶ relay :587/465 (AUTH ▸ From ▸ sender) ─┤
      con los datos SMTP del relay pegados                                              │
      en Settings › Email Services                                                      ▼
                                                                             ┌──────────────────┐
@@ -48,10 +48,13 @@ plantilla de la subcuenta. El asunto y el cuerpo salen de `templates`.
 reply-to y cuerpo HTML a mano. Admite los merge fields de GHL (`{{contact.first_name}}`, etc.): GHL
 los resuelve **antes** de llamarnos, así que nos llega el texto ya interpolado.
 
-**3. Relay SMTP (sección activable).** La app te da un host, un puerto, un usuario y una contraseña
-que pegas en *Settings › Email Services › SMTP Service* de la subcuenta. A partir de ahí usas el
-**nodo nativo de email de GHL** y el correo entra por nuestro servidor SMTP, que lo enruta y lo envía
-por el proveedor que corresponda.
+**3. Relay SMTP (sección activable).** La app te da un host, dos puertos (`587` con TLS/STARTTLS y
+`465` con SSL), un usuario y una contraseña que pegas en *Settings › Email Services › SMTP Service*
+de la subcuenta. A partir de ahí usas el **nodo nativo de email de GHL** y el correo entra por
+nuestro servidor SMTP, que lo enruta y lo envía por el proveedor que corresponda. El certificado
+TLS de ese host lo lee la app del `acme.json` de Traefik, que ya lo emite y renueva (sin Traefik
+delante, lo pide ella misma a Let's Encrypt por ACME HTTP-01): encender el relay son unos pocos
+pasos ([DEPLOY.md](DEPLOY.md), sección D).
 
 ### El enrutado del relay va por el remitente, no por lo que configuraste en GHL
 
@@ -84,7 +87,7 @@ Un solo contenedor con tres cosas dentro, y dos almacenes.
 |---|---|---|
 | **Servidor HTTP (Fastify 5)** | Panel React, API de subcuenta y de admin, endpoints de los nodos de GHL, webhooks de Brevo y tracking (`/t/*`) | — |
 | **Worker de envío** | Reclama mensajes de `messages` con `FOR UPDATE SKIP LOCKED`, inserta el pixel, reescribe enlaces, llama al proveedor y aplica reintentos | `WORKER_HABILITADO=false` |
-| **Relay SMTP** | Servidor `smtp-server` que recibe el correo del nodo nativo de GHL y lo mete en la misma cola | `SMTP_RELAY_ENABLED=false` (por defecto) |
+| **Relay SMTP** | Servidor `smtp-server` con dos escuchas (STARTTLS y SSL) que recibe el correo del nodo nativo de GHL y lo mete en la misma cola. Su certificado TLS lo lee del `acme.json` de Traefik (que ya lo renueva) o, sin Traefik delante, lo emite la app por ACME HTTP-01; en ambos casos se aplica en caliente | `SMTP_RELAY_ENABLED=false` (por defecto) |
 | **Postgres** | Fuente única de verdad **y** cola de envío. Las migraciones corren solas al arrancar | — |
 | **Redis** | Sesiones, locks (refresco de token OAuth, worker) y límites de envío por subcuenta | — |
 
@@ -136,9 +139,12 @@ emails-disruptivo/
 │  ├─ db.js               pool de Postgres + migrador con pg_advisory_lock
 │  ├─ redis.js            cliente de Redis (sesiones, locks, rate limit)
 │  ├─ migrations/
-│  │  └─ 001_init.sql     esquema completo (idempotente, se aplica una sola vez)
+│  │  ├─ 001_init.sql     esquema base (idempotente, cada una se aplica una sola vez)
+│  │  ├─ 002_tracking.sql · 003_rebotados.sql
+│  │  └─ 004_tls.sql      tabla tls_certificates (certificado del relay, clave cifrada)
 │  ├─ lib/
 │  │  ├─ crypto.js        AES-256-GCM para credenciales · scrypt para el relay
+│  │  ├─ acme.js          certificado Let's Encrypt del relay: emisión, estado y renovación
 │  │  ├─ sso.js           descifrado del contexto de usuario de GHL
 │  │  ├─ ghl.js           OAuth, refresco de token con lock, llamadas a la API
 │  │  ├─ auth.js          guardas de sesión (admin, subcuenta y secreto de nodo)
@@ -155,12 +161,13 @@ emails-disruptivo/
 │  │     ├─ brevo.js      API transaccional de Brevo
 │  │     └─ smtp.js       SMTP genérico con nodemailer
 │  ├─ smtp-relay/
-│  │  ├─ index.js         servidor SMTP entrante (arranque, TLS, límites)
+│  │  ├─ index.js         servidor SMTP entrante (dos escuchas, TLS en caliente, límites)
 │  │  ├─ auth.js          AUTH PLAIN/LOGIN contra relay_accounts
 │  │  ├─ routing.js       enrutado por el From y carga de la cuenta de relay
 │  │  └─ handler.js       RCPT TO y DATA: parseo del mensaje y alta en la cola
 │  └─ routes/
 │     ├─ oauth.js         instalación, callback y sesión por SSO
+│     ├─ acme.js          /.well-known/acme-challenge/:token — reto HTTP-01
 │     ├─ location.js      /api/loc/*  — panel de subcuenta
 │     ├─ admin.js         /api/admin/* — panel de la agencia
 │     ├─ actions.js       /api/ghl/*  — nodos y campos Dynamic
@@ -188,10 +195,18 @@ emails-disruptivo/
 | `ENCRYPTION_KEY` | **sí** | — | 32 bytes en base64 o hex; cifra las credenciales. Sin ella no arranca |
 | `ADMIN_USER` / `ADMIN_PASS` | **sí** | — | login del panel de admin |
 | `SMTP_RELAY_ENABLED` | no | `false` | levanta el servidor SMTP del relay |
-| `SMTP_RELAY_PORT` | no | `2525` | puerto del relay dentro del contenedor |
-| `SMTP_RELAY_HOST` | no | `APP_BASE_URL` | host que se le muestra al usuario para pegar en GHL |
-| `SMTP_RELAY_TLS_CERT` / `SMTP_RELAY_TLS_KEY` | no | — | rutas al certificado; sin ellas solo STARTTLS oportunista |
+| `SMTP_RELAY_PORT` | no | `2525` | escucha TLS/STARTTLS dentro del contenedor |
+| `SMTP_RELAY_PORT_SSL` | no | `2465` | escucha SSL (TLS implícito) dentro del contenedor; vacía = no se levanta |
+| `SMTP_RELAY_PUBLIC_PORT` | no | `587` | puerto público que EasyPanel publica hacia `SMTP_RELAY_PORT` y que el panel enseña a la subcuenta |
+| `SMTP_RELAY_PUBLIC_PORT_SSL` | no | `465` | ídem para la escucha SSL |
+| `SMTP_RELAY_HOST` | no | host de `APP_BASE_URL` | host del relay: el que pega el cliente en GHL y cuyo certificado se usa. Si es otro, dalo de alta con HTTPS en *Domains* para que Traefik tenga su certificado |
+| `SMTP_RELAY_TRAEFIK_ACME` | no | — | **modo recomendado en EasyPanel**: ruta, dentro del contenedor, del `acme.json` de Traefik (p. ej. `/certs/acme.json`, con el directorio de Traefik montado en `/certs`). La app lee de ahí el certificado que Traefik ya renueva y no llama a Let's Encrypt |
+| `SMTP_RELAY_TLS_AUTO` | no | `true` | sin `SMTP_RELAY_TRAEFIK_ACME`: emite y renueva solo el certificado con Let's Encrypt (ACME HTTP-01 desde la app). No funciona detrás de Traefik con ACME |
+| `ACME_EMAIL` | no | — | contacto opcional de la cuenta ACME (modo HTTP-01 propio) |
+| `ACME_DIRECTORY` | no | LE producción | URL del directorio ACME o `staging` para pruebas (modo HTTP-01 propio) |
+| `SMTP_RELAY_TLS_CERT` / `SMTP_RELAY_TLS_KEY` | no | — | certificado manual en ficheros; tiene prioridad sobre Traefik y sobre el automático. Sin nada de lo anterior: autofirmado provisional |
 | `SMTP_RELAY_MAX_SIZE` | no | `26214400` | tamaño máximo de mensaje (25 MB) |
+| `SMTP_BOUNCE_DOMAIN` | no | — | activa VERP y la captura de rebotes por el relay (puerto 25) |
 | `ENVIO_LIMITE_MINUTO` | no | `60` | tope de envíos por subcuenta y minuto |
 | `ENVIO_LIMITE_DIA` | no | `5000` | tope de envíos por subcuenta y día |
 | `WORKER_CONCURRENCIA` | no | `5` | mensajes en paralelo |
@@ -226,8 +241,12 @@ docker compose logs -f app
 
 - Panel en `http://localhost:8080` · salud en `http://localhost:8080/healthz`.
 - Las migraciones corren solas al arrancar; no hay que ejecutar nada a mano.
-- El relay SMTP viene **apagado**. Para probarlo en local pon `SMTP_RELAY_ENABLED=true` y publica el
-  puerto `2525` en tu `.env`.
+- El relay SMTP viene **apagado**. Para probarlo en local pon `SMTP_RELAY_ENABLED=true`; el
+  compose publica `SMTP_RELAY_PUBLIC_PORT` (587) hacia la escucha `2525` y
+  `SMTP_RELAY_PUBLIC_PORT_SSL` (465) hacia `2465`. En local no hay Let's Encrypt (el host no es
+  público): el relay usa el autofirmado provisional y el panel lo enseña como «certificado en
+  emisión». En producción el certificado se lee del `acme.json` de Traefik
+  (`SMTP_RELAY_TRAEFIK_ACME`, DEPLOY.md §D).
 
 En local, GHL no puede llamar a `http://localhost`. Para probar los nodos y los webhooks de Brevo
 necesitas un túnel HTTPS y poner esa URL en `APP_BASE_URL`.
@@ -323,7 +342,8 @@ dos activos cada enlace queda envuelto dos veces (ver [GHL-SETUP.md](GHL-SETUP.m
 
 Los pasos 4 a 13 son idénticos. Lo único que cambia es la entrada:
 
-1. GHL abre una conexión SMTP contra el relay y autentica (`AUTH LOGIN`/`PLAIN`) con el usuario y la
+1. GHL abre una conexión SMTP contra el relay (`587` con STARTTLS o `465` con SSL; las dos escuchas
+   comparten certificado, auth y límites) y autentica (`AUTH LOGIN`/`PLAIN`) con el usuario y la
    contraseña que copiaste del panel. De ahí sale el `location_id`.
 2. Se lee el `From` del mensaje y se aplica el enrutado por remitente descrito arriba, que resuelve
    el `sender_id` y el `provider_id`.

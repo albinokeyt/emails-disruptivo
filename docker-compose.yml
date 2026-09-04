@@ -48,13 +48,29 @@ services:
       WORKER_HABILITADO: ${WORKER_HABILITADO:-true}
       WORKER_CONCURRENCIA: ${WORKER_CONCURRENCIA:-5}
       SMTP_RELAY_ENABLED: ${SMTP_RELAY_ENABLED:-false}
+      # escuchas internas fijas (SPEC §13.2); los puertos que se publican en el host van abajo
       SMTP_RELAY_PORT: 2525
+      SMTP_RELAY_PORT_SSL: 2465
+      SMTP_RELAY_PUBLIC_PORT: ${SMTP_RELAY_PUBLIC_PORT:-587}
+      SMTP_RELAY_PUBLIC_PORT_SSL: ${SMTP_RELAY_PUBLIC_PORT_SSL:-465}
       SMTP_RELAY_HOST: ${SMTP_RELAY_HOST:-localhost}
+      # en local no hay Traefik ni host público para el reto HTTP-01: se queda con el autofirmado.
+      # Con un Traefik propio delante, monta su directorio en /certs (volumes, abajo) y pon
+      # SMTP_RELAY_TRAEFIK_ACME=/certs/acme.json en .env (DEPLOY.md §D)
+      SMTP_RELAY_TRAEFIK_ACME: ${SMTP_RELAY_TRAEFIK_ACME:-}
+      SMTP_RELAY_TLS_AUTO: ${SMTP_RELAY_TLS_AUTO:-false}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      ACME_DIRECTORY: ${ACME_DIRECTORY:-}
       SMTP_RELAY_MAX_SIZE: ${SMTP_RELAY_MAX_SIZE:-26214400}
     ports:
       - "${APP_PORT:-8080}:8080"
-      # el relay solo escucha si SMTP_RELAY_ENABLED=true; publicar el puerto de más no molesta
-      - "${SMTP_RELAY_PUBLIC_PORT:-2525}:2525"
+      # el relay solo escucha si SMTP_RELAY_ENABLED=true; publicar los puertos de más no molesta.
+      # Mismo esquema que EasyPanel: 587 → 2525 (STARTTLS) y 465 → 2465 (SSL)
+      - "${SMTP_RELAY_PUBLIC_PORT:-587}:2525"
+      - "${SMTP_RELAY_PUBLIC_PORT_SSL:-465}:2465"
+    # Modo traefik fuera de EasyPanel: descomenta y apunta al directorio de tu Traefik (solo lectura)
+    # volumes:
+    #   - /ruta/a/traefik:/certs:ro
     restart: unless-stopped
 
 volumes:

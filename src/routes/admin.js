@@ -19,6 +19,7 @@ import {
   activarCuentaRelay,
   cabecera,
   cargarProveedor,
+  datosRelay,
   esEmail,
   filtrosEnvios,
   idDe,
@@ -30,6 +31,11 @@ import {
   validarCredenciales,
   validarLimiteDiario,
 } from './location.js'
+// SPEC §13: estado de la pasarela (puertos públicos y certificado en uso), emisión ACME y modo traefik.
+import { config } from '../config.js'
+import { actualizarCertificado, estadoRelay, hostRelay } from '../smtp-relay/index.js'
+import { asegurarCertificado, estadoCertificado, motivoSinCertificado } from '../lib/acme.js'
+import { comprobarCertificadoTraefik, estadoTraefik } from '../lib/traefik.js'
 
 // SPEC §5.3 — API del panel de la agencia. Todo bajo requireAdmin salvo el propio login.
 // Los secretos guardados (client_secret, shared_secret, credenciales de proveedor) NUNCA se
@@ -670,7 +676,197 @@ export default async function adminRoutes(app) {
     }
     const { cuenta, contrasena } = await activarCuentaRelay(locationId)
     // la contraseña solo viaja en esta respuesta: si no se copia ahora, hay que rotarla
-    return { location_id: locationId, ...serializarRelay(cuenta), contrasena }
+    return { location_id: locationId, ...(await serializarRelay(cuenta)), contrasena }
+  })
+
+  // ---------------------------------------------------------------------------
+  // Relay de la plataforma y certificado TLS (SPEC §13.3)
+  // ---------------------------------------------------------------------------
+
+  // estadoCertificado lee tls_certificates; si la consulta falla, el estado del relay se devuelve
+  // igualmente y el fallo viaja como last_error para que la tarjeta del admin lo enseñe.
+  const estadoDelCertificado = async (host) => {
+    if (!host) return null
+    try {
+      return (await estadoCertificado(host)) ?? null
+    } catch (err) {
+      return {
+        hostname: host,
+        valido: false,
+        issued_at: null,
+        expires_at: null,
+        last_error: `No se pudo consultar el certificado guardado: ${texto(err?.message) || 'error desconocido'}`,
+        last_attempt_at: null,
+        dias_restantes: null,
+      }
+    }
+  }
+
+  // Origen del certificado según la precedencia del SPEC §13.1 (ficheros > traefik > acme > ninguno).
+  const origenCertificado = () => {
+    if (config.relay.tlsCert && config.relay.tlsKey) return 'ficheros'
+    if (config.relay.traefikAcme) return 'traefik'
+    if (config.relay.tlsAuto) return 'acme'
+    return 'ninguno'
+  }
+
+  app.get('/api/admin/relay', guard, async () => {
+    const relay = estadoRelay()
+    const origen = origenCertificado()
+    // escuchas internas del contenedor, aparte de los puertos públicos que devuelve estadoRelay()
+    relay.puertos_internos = { starttls: config.relay.puerto, ssl: config.relay.puertoSsl }
+    relay.origen_certificado = origen
+
+    const traefik = origen === 'traefik' ? estadoTraefik() : null
+    const certificado = origen === 'acme' ? await estadoDelCertificado(relay.tls.hostname) : null
+
+    // La pasarela solo conoce sus propios fallos (ficheros, certificado rechazado); el motivo real
+    // está en el módulo que obtiene el certificado: estadoTraefik() en modo traefik, o
+    // tls_certificates (src/lib/acme.js) con ACME propio. Se completa aquí para que la tarjeta
+    // del admin pinte el rojo con el error sin tener que cruzar los objetos.
+    if (relay.tls.modo === 'autofirmado' && !relay.tls.error) {
+      if (traefik && texto(traefik.ultimo_error)) relay.tls.error = texto(traefik.ultimo_error)
+      else if (certificado && !certificado.emitiendo && texto(certificado.last_error)) relay.tls.error = texto(certificado.last_error)
+    }
+    return { relay, certificado, traefik }
+  })
+
+  // Renovación forzada de un certificado ACME que aún vale: Let's Encrypt limita a 5 certificados
+  // idénticos por semana, así que cinco pulsaciones del botón dejarían al host sin poder renovar
+  // durante una semana. Solo se admite pasadas 48 h desde la emisión y con un freno de 1 h en Redis.
+  const HORAS_MIN_ENTRE_FORZADAS = 48
+  const FRENO_FORZADA_S = 3600
+  const claveFreno = (host) => `acme:forzado:${host}`
+
+  // Fuerza la emisión o renovación ahora (o, en modo traefik, relee el acme.json de Traefik).
+  // asegurarCertificado ya respeta el lock entre instancias y la cuota de un intento por hora tras
+  // un error (anti-abuso de Let's Encrypt), y nunca lanza por un fallo de emisión: devuelve null y
+  // deja el motivo en last_error.
+  app.post('/api/admin/relay/certificado', guard, async (req) => {
+    const host = hostRelay()
+    if (!host) {
+      return { ok: false, error: 'No hay host para el certificado: define SMTP_RELAY_HOST o una APP_BASE_URL válida', estado: null }
+    }
+    const origen = origenCertificado()
+    const tls = estadoRelay().tls
+
+    if (origen === 'ficheros' || tls.modo === 'ficheros') {
+      return {
+        ok: false,
+        error: 'El relay usa el certificado de ficheros (SMTP_RELAY_TLS_CERT/_KEY): renuévalo en el volumen y reinicia el servicio; no hay nada que pedir a Let’s Encrypt.',
+        estado: null,
+      }
+    }
+
+    if (origen === 'traefik') {
+      // sin CA de por medio: se relee el fichero y se aplica a las escuchas de esta instancia
+      let aplicacion = null
+      const leido = await comprobarCertificadoTraefik({
+        log: req.log,
+        forzar: true,
+        alCambiar: (certificado) => {
+          aplicacion = actualizarCertificado(certificado, req.log)
+          return aplicacion
+        },
+      })
+      const traefik = estadoTraefik()
+      if (!leido) {
+        return { ok: false, error: texto(traefik.ultimo_error) || 'No se pudo leer el certificado del acme.json de Traefik', estado: null, traefik }
+      }
+      return {
+        ok: true,
+        estado: null,
+        traefik,
+        aplicado: aplicacion?.aplicado === true,
+        detalle: aplicacion?.error || null,
+        mensaje: `Certificado leído del acme.json de Traefik (resolver ${traefik.resolver || '?'}), válido hasta ${leido.expiresAt.toISOString()}.`,
+        relay: estadoRelay(),
+      }
+    }
+
+    if (origen !== 'acme') {
+      return {
+        ok: false,
+        error: 'La emisión automática está desactivada (SMTP_RELAY_TLS_AUTO=false) y no hay SMTP_RELAY_TRAEFIK_ACME ni ficheros: no hay de dónde sacar un certificado.',
+        estado: null,
+      }
+    }
+
+    // Con un certificado ACME ya aplicado y con más de 30 días de vida, el botón significa
+    // «renovar a la fuerza»; con menos de 30 días, asegurarCertificado renueva de todos modos; y
+    // con el autofirmado significa «consíguelo»: si en tls_certificates ya hay uno válido se aplica
+    // sin gastar cuota de la CA, y si no, se emite.
+    const previo = await estadoDelCertificado(host)
+    const forzar = tls.modo === 'acme' && previo?.valido === true && Number(previo.dias_restantes) >= 30
+    if (forzar) {
+      const emitidoHace = previo.issued_at ? Date.now() - new Date(previo.issued_at).getTime() : Infinity
+      if (emitidoHace < HORAS_MIN_ENTRE_FORZADAS * 3_600_000) {
+        return {
+          ok: false,
+          error:
+            `El certificado actual se emitió hace ${Math.max(1, Math.round(emitidoHace / 3_600_000))} h y aún le quedan ${previo.dias_restantes} días. ` +
+            `Let’s Encrypt limita a 5 certificados idénticos por semana, así que la renovación forzada solo se admite pasadas ${HORAS_MIN_ENTRE_FORZADAS} h desde la emisión; la automática llegará sola cuando queden menos de 30 días.`,
+          estado: previo,
+        }
+      }
+      let frenado = false
+      try {
+        frenado = (await redis.set(claveFreno(host), '1', 'EX', FRENO_FORZADA_S, 'NX')) !== 'OK'
+      } catch {
+        frenado = false
+      }
+      if (frenado) {
+        return {
+          ok: false,
+          error: 'Ya se forzó una renovación hace menos de una hora. Espera a que pase para volver a intentarlo (cuota de Let’s Encrypt).',
+          estado: previo,
+        }
+      }
+    }
+
+    let certificado
+    try {
+      certificado = await asegurarCertificado(host, { log: req.log, forzar })
+    } catch (err) {
+      // solo el mensaje: ni tokens ACME ni claves acaban en el log ni en la respuesta
+      req.log.error({ host, motivo: texto(err?.message) }, 'relay: fallo forzando la emision del certificado')
+      return {
+        ok: false,
+        error: texto(err?.message) || 'No se pudo emitir el certificado',
+        estado: await estadoDelCertificado(host),
+      }
+    }
+
+    const estado = await estadoDelCertificado(host)
+    if (!certificado?.cert || !certificado?.key) {
+      const motivo = motivoSinCertificado(host)
+      const explicaciones = {
+        lock: 'Hay otra emisión en curso (o quedó un lock de un redespliegue a mitad de emisión; caduca en 5 minutos). Vuelve a probar en unos minutos.',
+        cuota: 'El último intento falló hace menos de una hora y la app no vuelve a llamar a Let’s Encrypt hasta que pase (cuota anti-abuso).',
+        host: 'El host del relay no puede tener un certificado público (localhost, IP o dominio de ejemplo).',
+        fallo: 'Fallo inesperado consultando el certificado (Postgres, Redis o clave de cifrado). Mira el log del servicio.',
+      }
+      return {
+        ok: false,
+        error:
+          (motivo === 'error' && texto(estado?.last_error)) ||
+          explicaciones[motivo] ||
+          texto(estado?.last_error) ||
+          'No se pudo emitir el certificado ahora mismo. Vuelve a probar más tarde.',
+        estado,
+      }
+    }
+
+    // Se aplica en caliente a las escuchas de ESTA instancia; si el relay corre en otra, la
+    // renovación periódica de esa instancia lo recogerá de tls_certificates.
+    const aplicacion = actualizarCertificado({ ...certificado, origen: 'acme' }, req.log)
+    return {
+      ok: true,
+      estado,
+      aplicado: aplicacion.aplicado,
+      detalle: aplicacion.error || null,
+      relay: estadoRelay(),
+    }
   })
 
   // ---------------------------------------------------------------------------
@@ -678,7 +874,12 @@ export default async function adminRoutes(app) {
   // ---------------------------------------------------------------------------
   // Vista de ajustes con los secretos enmascarados. La usan igual el GET y la respuesta del PUT.
   async function vistaAjustes() {
-    const [cfg, limites, adminsGuardados] = await Promise.all([getGhlConfig(), getLimites(), getSetting('admins')])
+    const [cfg, limites, adminsGuardados, relay] = await Promise.all([
+      getGhlConfig(),
+      getLimites(),
+      getSetting('admins'),
+      datosRelay(),
+    ])
     const admins = adminsGuardados || {}
     // el secreto de las URLs de los nodos se genera la primera vez que se abren los ajustes
     const actionSecret = await asegurarActionSecret()
@@ -707,11 +908,8 @@ export default async function adminRoutes(app) {
         emails: Array.isArray(admins.emails) ? admins.emails : [],
         company_ids: Array.isArray(admins.company_ids) ? admins.company_ids : [],
       },
-      relay: {
-        host: texto(process.env.SMTP_RELAY_HOST) || (base ? base.replace(/^https?:\/\//, '').split('/')[0] : ''),
-        port: Number(process.env.SMTP_RELAY_PORT) || 2525,
-        servidor_activo: String(process.env.SMTP_RELAY_ENABLED || '').toLowerCase() === 'true',
-      },
+      // mismos datos (puertos PÚBLICOS y estado TLS) que ve la subcuenta en GET /api/loc/relay
+      relay,
     }
   }
 

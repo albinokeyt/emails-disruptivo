@@ -8,8 +8,9 @@ import { errorSmtp } from './routing.js'
 //
 // Esta pasarela NO es un servidor abierto: cada subcuenta de la agencia tiene su propio usuario y
 // su propia contraseña (generados en el panel, guardados con scrypt) y sin credenciales válidas no
-// se acepta ni un byte. smtp-server se configura con authOptional:false y allowInsecureAuth:false,
-// así que el AUTH ni siquiera se anuncia antes de STARTTLS.
+// se acepta ni un byte. smtp-server se configura con authOptional:false y allowInsecureAuth:false:
+// el AUTH se anuncia en el EHLO, pero en claro se rechaza con «538 Must issue a STARTTLS command
+// first» hasta que la sesión sube a TLS, así que ninguna credencial viaja sin cifrar.
 // ---------------------------------------------------------------------------
 
 // Un único mensaje para TODOS los fallos de credenciales: si el texto cambiara según el usuario

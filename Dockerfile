@@ -24,8 +24,9 @@ COPY src/ ./src/
 COPY --from=panel /app/web/dist ./web/dist
 
 # 8080 = API + panel (lo enruta Traefik por HTTP).
-# 2525 = pasarela SMTP; es TCP plano, así que se publica desde la sección Ports, no desde Domains.
-EXPOSE 8080 2525
+# 2525 = pasarela SMTP con STARTTLS y 2465 = la misma con SSL; son TCP plano, así que se publican
+# desde la sección Ports (587 → 2525 y 465 → 2465), no desde Domains.
+EXPOSE 8080 2525 2465
 
 # en forma de shell a propósito: así respeta PORT si se cambia por variable de entorno
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

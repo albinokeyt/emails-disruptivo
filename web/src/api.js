@@ -143,6 +143,10 @@ export const crearDominioTracking = (datos) => api.post('/api/loc/dominios-track
 export const verificarDominioTracking = (id) => api.post(`/api/loc/dominios-tracking/${id}/verificar`)
 export const eliminarDominioTracking = (id) => api.del(`/api/loc/dominios-tracking/${id}`)
 
+// GET devuelve `port` (el PÚBLICO, 587 por defecto: nunca la escucha interna del contenedor),
+// `puerto_ssl` (465, o null si la escucha SSL no está levantada), `tls_ok` y `tls_valido_hasta`
+// (SPEC §13.3). La pantalla usa `tls_error` si el backend lo incluye; si no, un certificado no
+// válido se muestra como «en emisión».
 export const obtenerRelay = () => api.get('/api/loc/relay')
 // activar y rotar devuelven la contraseña UNA SOLA VEZ: hay que enseñarla en ese momento.
 export const activarRelay = () => api.post('/api/loc/relay/activar')
@@ -200,6 +204,13 @@ export const adminActivarRelay = (locationId) =>
 
 export const adminObtenerAjustes = () => api.get('/api/admin/ajustes')
 export const adminGuardarAjustes = (datos) => api.put('/api/admin/ajustes', datos)
+
+// Relay SMTP y certificado TLS (SPEC §13.3): estadoRelay() del relay + estadoCertificado() de ACME.
+export const obtenerEstadoRelayAdmin = () => api.get('/api/admin/relay')
+// Fuerza la emisión o renovación del certificado ahora. Respeta el lock entre instancias y la cuota
+// de un intento por hora tras un error. Responde { ok, estado } o { ok:false, error } con 200:
+// hay que mirar `ok`, no solo confiar en que no lance.
+export const emitirCertificadoRelay = () => api.post('/api/admin/relay/certificado')
 
 /* ============================================================
    Formateo

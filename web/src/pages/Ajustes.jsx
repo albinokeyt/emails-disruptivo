@@ -1,8 +1,282 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api } from '../api.js'
-import { Aviso, Boton, Campo, Copiar, Interruptor, Spinner } from '../components/ui.jsx'
+import { api, emitirCertificadoRelay, fmtFecha, fmtFechaHora, obtenerEstadoRelayAdmin } from '../api.js'
+import { Aviso, Badge, Boton, Campo, Copiar, Interruptor, Spinner } from '../components/ui.jsx'
 
 const TARJETA = 'bg-card border border-border rounded-2xl p-5'
+
+/* ============================================================
+   Relay SMTP y certificado TLS (SPEC §13)
+   ============================================================ */
+
+const MODOS_TLS = {
+  acme: 'Let’s Encrypt (automático, ACME HTTP-01 desde la app)',
+  traefik: 'Let’s Encrypt vía Traefik (leído de su acme.json)',
+  ficheros: 'Ficheros (SMTP_RELAY_TLS_CERT / _KEY)',
+  autofirmado: 'Autofirmado (provisional, hasta que llegue el de Let’s Encrypt)',
+}
+
+// De dónde va a salir el certificado según la configuración (relay.origen_certificado del backend).
+const ORIGENES = {
+  traefik: 'del acme.json de Traefik (SMTP_RELAY_TRAEFIK_ACME)',
+  acme: 'de Let’s Encrypt por ACME HTTP-01 desde la propia app',
+  ficheros: 'de los ficheros SMTP_RELAY_TLS_CERT / _KEY',
+  ninguno: 'de ningún sitio: SMTP_RELAY_TLS_AUTO=false sin ficheros ni Traefik',
+}
+
+// GET /api/admin/relay = estadoRelay() + estadoCertificado() (+ estadoTraefik() en modo traefik)
+// (SPEC §13.2 y §13.3). Se aceptan las dos maneras razonables de mezclarlos: los campos del relay
+// al nivel raíz o anidados en `relay`, el certificado en `certificado` y Traefik en `traefik`.
+// Así la tarjeta no se queda en blanco por un detalle de forma.
+function normalizarRelay(d) {
+  const raiz = d && typeof d === 'object' ? d : {}
+  const r = raiz.relay && typeof raiz.relay === 'object' ? raiz.relay : raiz
+  const c = raiz.certificado && typeof raiz.certificado === 'object' ? raiz.certificado : {}
+  const t = raiz.traefik && typeof raiz.traefik === 'object' ? raiz.traefik : {}
+  const tls = r.tls && typeof r.tls === 'object' ? r.tls : {}
+  const puertos = r.puertos && typeof r.puertos === 'object' ? r.puertos : {}
+  const internos = r.puertos_internos && typeof r.puertos_internos === 'object' ? r.puertos_internos : null
+  const error = tls.error || c.last_error || t.ultimo_error || null
+  const validoHasta = tls.valido_hasta || c.expires_at || t.valido_hasta || null
+  const modo = tls.modo || null
+  const valido =
+    typeof c.valido === 'boolean'
+      ? c.valido
+      : modo === 'ficheros' || ((modo === 'acme' || modo === 'traefik') && Boolean(validoHasta))
+  return {
+    activo: Boolean(r.activo ?? raiz.activo),
+    host: r.host || tls.hostname || c.hostname || t.hostname || '',
+    hostnameCert: c.hostname || tls.hostname || '',
+    puertos: { starttls: puertos.starttls ?? null, ssl: puertos.ssl ?? null },
+    puertosInternos: internos ? { starttls: internos.starttls ?? null, ssl: internos.ssl ?? null } : null,
+    origen: r.origen_certificado || null,
+    modo,
+    valido,
+    validoHasta,
+    error: error ? String(error) : null,
+    // último certificado que la pasarela no pudo aplicar aunque el que sirve siga bien
+    ultimoRechazo: tls.ultimo_rechazo ? String(tls.ultimo_rechazo) : null,
+    emitidoEl: c.issued_at || null,
+    ultimoIntento: c.last_attempt_at || t.ultima_lectura || null,
+    diasRestantes: typeof c.dias_restantes === 'number' ? c.dias_restantes : null,
+    traefikRuta: t.ruta || null,
+    traefikResolver: t.resolver || null,
+  }
+}
+
+function BadgeCertificadoAdmin({ relay }) {
+  if (!relay.activo) return <Badge estado="inactivo">Relay apagado</Badge>
+  if (relay.modo === 'ficheros') return <Badge estado="ok">Certificado manual en ficheros</Badge>
+  if (relay.valido) {
+    return (
+      <Badge estado="ok">
+        Válido{relay.validoHasta ? ` hasta ${fmtFecha(relay.validoHasta)}` : ''}
+        {relay.diasRestantes != null ? ` · ${relay.diasRestantes} días` : ''}
+      </Badge>
+    )
+  }
+  if (relay.error) {
+    return (
+      <Badge estado="error" titulo={relay.error}>
+        Error en la emisión
+      </Badge>
+    )
+  }
+  return <Badge estado="pendiente">En emisión</Badge>
+}
+
+const Fila = ({ etiqueta, children, mono = false }) => (
+  <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5">
+    <div className="text-[11px] text-mut uppercase tracking-wide mb-1">{etiqueta}</div>
+    <div className={`text-sm text-ink break-all ${mono ? 'font-mono' : ''}`}>{children}</div>
+  </div>
+)
+
+function TarjetaRelay() {
+  const [relay, setRelay] = useState(null) // null = cargando
+  const [error, setError] = useState('')
+  const [emitiendo, setEmitiendo] = useState(false)
+  const [refrescando, setRefrescando] = useState(false)
+  const [resultado, setResultado] = useState(null) // { tipo: 'ok'|'error', texto }
+
+  const cargar = useCallback(async () => {
+    try {
+      const d = await obtenerEstadoRelayAdmin()
+      setRelay(normalizarRelay(d))
+      setError('')
+    } catch (e) {
+      setError(e.message)
+      setRelay(normalizarRelay(null))
+    }
+  }, [])
+
+  useEffect(() => {
+    cargar()
+  }, [cargar])
+
+  const refrescar = async () => {
+    setRefrescando(true)
+    try {
+      await cargar()
+    } finally {
+      setRefrescando(false)
+    }
+  }
+
+  const emitir = async () => {
+    setEmitiendo(true)
+    setResultado(null)
+    try {
+      const r = await emitirCertificadoRelay()
+      const estado = r?.estado && typeof r.estado === 'object' ? r.estado : null
+      const validoHasta = estado?.expires_at || r?.traefik?.valido_hasta || null
+      if (r?.ok === false) {
+        setResultado({ tipo: 'error', texto: r.error || 'No se ha podido emitir el certificado.' })
+      } else if (estado && estado.valido === false && estado.last_error) {
+        setResultado({ tipo: 'error', texto: String(estado.last_error) })
+      } else if (r?.aplicado === false) {
+        // emitido (o leído) y guardado, pero la pasarela de esta instancia no lo ha aplicado:
+        // relay con certificado de ficheros, relay no arrancado aquí, updateSecureContext fallido…
+        setResultado({
+          tipo: 'warn',
+          texto:
+            `Certificado obtenido${validoHasta ? ` (válido hasta el ${fmtFecha(validoHasta)})` : ''}, pero NO aplicado al relay de esta instancia` +
+            `${r.detalle ? `: ${r.detalle}` : '.'}`,
+        })
+      } else if (r?.mensaje) {
+        setResultado({ tipo: 'ok', texto: `${r.mensaje} Aplicado en caliente.` })
+      } else if (validoHasta) {
+        setResultado({ tipo: 'ok', texto: `Certificado emitido y aplicado en caliente. Válido hasta el ${fmtFecha(validoHasta)}.` })
+      } else {
+        setResultado({
+          tipo: 'ok',
+          texto: 'Petición aceptada. El certificado se aplica solo en cuanto responde Let’s Encrypt; pulsa «Actualizar» en unos segundos.',
+        })
+      }
+    } catch (e) {
+      setResultado({ tipo: 'error', texto: e.message })
+    } finally {
+      setEmitiendo(false)
+      await cargar()
+    }
+  }
+
+  if (relay === null) {
+    return (
+      <div className={`${TARJETA} space-y-3`}>
+        <div className="text-sm font-semibold">Relay SMTP y certificado</div>
+        <Spinner texto="Consultando el relay…" />
+      </div>
+    )
+  }
+
+  const puertoStarttls = relay.puertos.starttls
+  const puertoSsl = relay.puertos.ssl
+  const internos = relay.puertosInternos
+  const esTraefik = relay.origen === 'traefik'
+  const esFicheros = relay.origen === 'ficheros'
+
+  return (
+    <div className={`${TARJETA} space-y-4`}>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="text-sm font-semibold">Relay SMTP y certificado</div>
+          <p className="text-[11px] text-mut mt-0.5">
+            Estado del servidor SMTP que reciben las subcuentas y de su certificado TLS. Precedencia: ficheros &gt; Traefik
+            (se lee el certificado que Traefik ya renueva) &gt; Let&rsquo;s Encrypt desde la app (ACME HTTP-01) &gt;
+            autofirmado provisional. En EasyPanel el modo que funciona es el de Traefik (DEPLOY.md, sección D).
+          </p>
+        </div>
+        <BadgeCertificadoAdmin relay={relay} />
+      </div>
+
+      {error && <Aviso variant="error">{error}</Aviso>}
+
+      {!relay.activo && (
+        <Aviso variant="warn">
+          El relay está apagado: <code className="text-ink">SMTP_RELAY_ENABLED</code> no es <code className="text-ink">true</code>{' '}
+          o la pasarela no pudo abrir ninguna escucha (mira el log del servicio). Las subcuentas ven el aviso de «servidor
+          apagado» en su pantalla Relay. Para encenderlo: DEPLOY.md, sección D.
+        </Aviso>
+      )}
+
+      {relay.activo && relay.origen === 'acme' && (
+        <Aviso variant="info">
+          El certificado se pide a Let&rsquo;s Encrypt desde la propia app (reto HTTP-01). Detrás de Traefik con ACME (EasyPanel)
+          ese reto no llega a la app: define <code className="text-ink">SMTP_RELAY_TRAEFIK_ACME</code> y monta el acme.json de
+          Traefik (DEPLOY.md, sección D).
+        </Aviso>
+      )}
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        <Fila etiqueta="Host del relay" mono>
+          {relay.host || '—'}
+        </Fila>
+        <Fila etiqueta="Puertos públicos (los que ven las subcuentas)" mono>
+          {puertoStarttls != null ? `${puertoStarttls} · TLS/STARTTLS` : '—'}
+          {puertoSsl != null ? ` / ${puertoSsl} · SSL` : ' / SSL no publicado'}
+        </Fila>
+        {internos && (
+          <Fila etiqueta="Escuchas internas del contenedor" mono>
+            {internos.starttls != null ? `${internos.starttls} · STARTTLS` : '—'}
+            {internos.ssl != null ? ` / ${internos.ssl} · SSL` : ' / SSL no levantado'}
+          </Fila>
+        )}
+        <Fila etiqueta="Origen del certificado">{relay.origen ? ORIGENES[relay.origen] || relay.origen : '—'}</Fila>
+        <Fila etiqueta="Modo TLS en servicio">{relay.modo ? MODOS_TLS[relay.modo] || relay.modo : '—'}</Fila>
+        <Fila etiqueta="Válido hasta">
+          {relay.validoHasta ? fmtFechaHora(relay.validoHasta) : '—'}
+          {relay.emitidoEl ? <span className="text-mut"> · emitido el {fmtFecha(relay.emitidoEl)}</span> : null}
+        </Fila>
+        <Fila etiqueta="Último error" mono>
+          {relay.error ? <span className="text-bad">{relay.error}</span> : <span className="text-mut">Ninguno</span>}
+          {!relay.error && relay.ultimoRechazo ? (
+            <span className="text-mut"> · último certificado rechazado (el que sirve sigue bien): {relay.ultimoRechazo}</span>
+          ) : null}
+        </Fila>
+        <Fila etiqueta={esTraefik ? 'Última lectura del acme.json' : 'Último intento de emisión'}>
+          {relay.ultimoIntento ? fmtFechaHora(relay.ultimoIntento) : '—'}
+          {esTraefik && relay.traefikRuta ? <span className="text-mut"> · {relay.traefikRuta}</span> : null}
+          {esTraefik && relay.traefikResolver ? <span className="text-mut"> · resolver {relay.traefikResolver}</span> : null}
+          {relay.hostnameCert && relay.hostnameCert !== relay.host ? (
+            <span className="text-mut"> · certificado de {relay.hostnameCert}</span>
+          ) : null}
+        </Fila>
+      </div>
+
+      <p className="text-[11px] text-mut">
+        Los puertos públicos son los que se pegan en GHL. Las escuchas internas son puertos altos a propósito (el contenedor
+        los abre sin privilegios): EasyPanel las publica en <em>Ports</em> como <code className="text-ink">587 → 2525</code>{' '}
+        y <code className="text-ink">465 → 2465</code>.
+      </p>
+
+      {resultado && (
+        <Aviso variant={resultado.tipo === 'ok' ? 'ok' : resultado.tipo === 'warn' ? 'warn' : 'error'}>{resultado.texto}</Aviso>
+      )}
+
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <Boton variant="ghost" onClick={refrescar} cargando={refrescando} disabled={emitiendo}>
+          Actualizar
+        </Boton>
+        <Boton onClick={emitir} cargando={emitiendo} disabled={refrescando || esFicheros}>
+          {emitiendo
+            ? esTraefik
+              ? 'Leyendo el acme.json…'
+              : 'Pidiendo a Let’s Encrypt…'
+            : esTraefik
+              ? 'Releer de Traefik ahora'
+              : 'Emitir / renovar ahora'}
+        </Boton>
+      </div>
+      <p className="text-[11px] text-mut text-right">
+        {esTraefik
+          ? 'La app relee el acme.json cuando Traefik lo cambia y, además, cada 12 h. Este botón lo relee ahora mismo; no llama a Let’s Encrypt.'
+          : esFicheros
+            ? 'Con certificado de ficheros no hay nada que pedir: renueva los ficheros en el volumen y reinicia el servicio.'
+            : 'Tras un error, la app no vuelve a llamar a Let’s Encrypt hasta pasada una hora (cuota anti-abuso), y la renovación forzada de un certificado que aún vale solo se admite pasadas 48 h desde su emisión; si acabas de intentarlo, el botón te lo dirá.'}
+      </p>
+    </div>
+  )
+}
 
 // Un secreto puede llegar como {configurado:true}, como cadena enmascarada o como booleano.
 function estaConfigurado(v) {
@@ -304,6 +578,8 @@ export default function Ajustes() {
           </Aviso>
         )}
       </div>
+
+      <TarjetaRelay />
     </div>
   )
 }

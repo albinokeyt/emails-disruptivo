@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { promises as dns } from 'node:dns'
+import { config } from '../config.js'
 import { q } from '../db.js'
 import { redis } from '../redis.js'
 import { requireLocation } from '../lib/auth.js'
@@ -391,17 +392,130 @@ async function limitar(clave, maximo, ventanaS) {
   }
 }
 
-const datosRelay = () => ({
-  host: texto(process.env.SMTP_RELAY_HOST) || (() => {
-    try {
-      return new URL(String(process.env.APP_BASE_URL || '')).hostname
-    } catch {
-      return ''
+// ---------------------------------------------------------------------------
+// Datos de conexión del relay que se enseñan al cliente (SPEC §13.2). Los puertos son SIEMPRE los
+// públicos (los que EasyPanel publica y GHL tiene que usar), nunca los internos del contenedor.
+// La configuración sale de config.relay (src/config.js): el mismo sitio que lee la pasarela, así
+// que el panel no puede anunciar un puerto o un estado distinto del que la pasarela aplica.
+// El estado del certificado lo publica src/smtp-relay/index.js (estadoRelay()); se carga de forma
+// perezosa y tolerante, como el registro de proveedores: si la pasarela no está disponible en esta
+// instancia, el panel sigue funcionando con los valores de la configuración.
+// ---------------------------------------------------------------------------
+const hostRelayConfigurado = () => texto(config.relay.host) || hostApp()
+const puertoPublicoRelay = () => config.relay.puertoPublico
+// null = la escucha SSL no está configurada (SMTP_RELAY_PORT_SSL vacía o 0/false/no/off)
+const puertoPublicoRelaySsl = () => config.relay.puertoPublicoSsl
+
+// Los módulos se cargan una sola vez; si la carga falla se reintenta en la siguiente petición.
+const cargas = new Map()
+async function cargarModulo(ruta) {
+  if (!cargas.has(ruta)) {
+    cargas.set(
+      ruta,
+      import(ruta).catch(() => {
+        cargas.delete(ruta)
+        return null
+      })
+    )
+  }
+  return cargas.get(ruta)
+}
+const funcionDe = (mod, nombre) =>
+  typeof mod?.[nombre] === 'function' ? mod[nombre] : typeof mod?.default?.[nombre] === 'function' ? mod.default[nombre] : null
+
+/** estadoRelay() de la pasarela de ESTA instancia, o null si no está disponible. */
+async function estadoDelRelay() {
+  const fn = funcionDe(await cargarModulo('../smtp-relay/index.js'), 'estadoRelay')
+  if (!fn) return null
+  try {
+    return fn()
+  } catch {
+    return null
+  }
+}
+
+/** estadoCertificado(host) de src/lib/acme.js (lee tls_certificates), o null si no está disponible. */
+async function estadoDelCertificado(host) {
+  if (!host) return null
+  const fn = funcionDe(await cargarModulo('../lib/acme.js'), 'estadoCertificado')
+  if (!fn) return null
+  try {
+    return (await fn(host)) ?? null
+  } catch {
+    return null
+  }
+}
+
+/** estadoTraefik() de src/lib/traefik.js (modo traefik: lectura del acme.json), o null. */
+async function estadoDelTraefik() {
+  const fn = funcionDe(await cargarModulo('../lib/traefik.js'), 'estadoTraefik')
+  if (!fn) return null
+  try {
+    return fn() ?? null
+  } catch {
+    return null
+  }
+}
+
+const fechaVigente = (v) => {
+  if (!v) return false
+  const d = new Date(v)
+  return !Number.isNaN(d.getTime()) && d.getTime() > Date.now()
+}
+
+// Modos con un certificado real en servicio (los que ponen el badge en verde si sigue vigente).
+const MODOS_TLS_REALES = new Set(['acme', 'traefik', 'ficheros'])
+
+export async function datosRelay() {
+  const estado = await estadoDelRelay()
+  const tls = estado?.tls || null
+  const host = texto(estado?.host) || hostRelayConfigurado()
+
+  let tlsModo = texto(tls?.modo) || 'autofirmado'
+  let tlsValidoHasta = tls?.valido_hasta || null
+  let tlsError = texto(tls?.error) || null
+
+  // La pasarela solo sabe qué certificado sirve AHORA en esta instancia. Mientras va con el
+  // autofirmado sin un motivo propio, el motivo real está en otro sitio: en modo traefik, en
+  // estadoTraefik() (fichero ilegible, host sin certificado…); con ACME propio, en
+  // tls_certificates (fallo de la CA o emisión en curso), que escribe src/lib/acme.js. Y solo si
+  // la pasarela NO está cargada en esta instancia (estado null: corre en otra), el certificado
+  // guardado es el único dato fiable y se da por servido.
+  if (tlsModo === 'autofirmado' && !tlsError) {
+    if (config.relay.traefikAcme) {
+      const traefik = await estadoDelTraefik()
+      if (texto(traefik?.ultimo_error)) tlsError = texto(traefik.ultimo_error)
+    } else if (config.relay.tlsAuto) {
+      const certificado = await estadoDelCertificado(host)
+      if (certificado) {
+        if (estado === null && certificado.valido) {
+          tlsModo = 'acme'
+          tlsValidoHasta = certificado.expires_at ? new Date(certificado.expires_at).toISOString() : null
+        } else if (!certificado.emitiendo && texto(certificado.last_error)) {
+          tlsError = texto(certificado.last_error)
+        }
+      }
     }
-  })(),
-  port: Number(process.env.SMTP_RELAY_PORT) || 2525,
-  servidor_activo: String(process.env.SMTP_RELAY_ENABLED || '').toLowerCase() === 'true',
-})
+  }
+
+  // servidor_activo = hay escuchas abiertas de verdad. Con la pasarela cargada en esta instancia
+  // manda su estado (un relay habilitado que no pudo abrir ningún puerto está APAGADO para el
+  // cliente); solo sin pasarela cargada se recurre a la configuración.
+  const servidorActivo = estado ? Boolean(estado.activo) : config.relay.habilitado
+
+  return {
+    host,
+    port: Number(estado?.puertos?.starttls) || puertoPublicoRelay(),
+    puerto_ssl: estado ? estado.puertos?.ssl ?? null : puertoPublicoRelaySsl(),
+    servidor_activo: servidorActivo,
+    // tls_ok = certificado real (ACME, Traefik o ficheros) y todavía vigente: decide el badge verde
+    tls_ok: MODOS_TLS_REALES.has(tlsModo) && fechaVigente(tlsValidoHasta),
+    tls_valido_hasta: tlsValidoHasta,
+    // modo 'autofirmado' sin error = certificado en emisión (ámbar); con error = rojo
+    tls_modo: tlsModo,
+    tls_error: tlsError,
+  }
+}
 
 const usuarioRelay = () => `ed${randomBytes(5).toString('hex')}`
 
@@ -435,29 +549,25 @@ export async function activarCuentaRelay(locationId) {
   throw new Error('No se pudo generar un usuario de relay libre')
 }
 
-export function serializarRelay(cuenta) {
-  const base = datosRelay()
+export async function serializarRelay(cuenta) {
+  const base = await datosRelay()
   if (!cuenta) {
     return {
       enabled: false,
-      host: base.host,
-      port: base.port,
+      ...base,
       username: null,
       tiene_password: false,
       default_provider_id: null,
       accept_unknown_senders: true,
-      servidor_activo: base.servidor_activo,
     }
   }
   return {
     enabled: cuenta.enabled,
-    host: base.host,
-    port: base.port,
+    ...base,
     username: cuenta.username,
     tiene_password: Boolean(cuenta.password_hash),
     default_provider_id: cuenta.default_provider_id,
     accept_unknown_senders: cuenta.accept_unknown_senders,
-    servidor_activo: base.servidor_activo,
     last_used_at: cuenta.last_used_at,
     rotated_at: cuenta.rotated_at,
   }
@@ -1580,6 +1690,8 @@ export default async function locationRoutes(app) {
   // ---------------------------------------------------------------------------
   // Relay SMTP
   // ---------------------------------------------------------------------------
+  // Devuelve host y puertos PÚBLICOS, puerto_ssl (null si no hay escucha SSL), tls_ok,
+  // tls_valido_hasta, tls_modo y tls_error (SPEC §13.2/§13.4).
   app.get('/api/loc/relay', guard, async (req) => {
     const { rows: [cuenta] } = await q('SELECT * FROM relay_accounts WHERE location_id=$1', [loc(req)])
     return serializarRelay(cuenta)
@@ -1588,7 +1700,7 @@ export default async function locationRoutes(app) {
   app.post('/api/loc/relay/activar', guard, async (req) => {
     const { cuenta, contrasena } = await activarCuentaRelay(loc(req))
     // la contraseña solo existe en esta respuesta: en la base solo queda su hash scrypt
-    return { ...serializarRelay(cuenta), contrasena }
+    return { ...(await serializarRelay(cuenta)), contrasena }
   })
 
   app.post('/api/loc/relay/rotar', guard, async (req, reply) => {
@@ -1600,7 +1712,7 @@ export default async function locationRoutes(app) {
       'UPDATE relay_accounts SET password_hash=$1, rotated_at=now(), updated_at=now() WHERE id=$2 RETURNING *',
       [hashPassword(contrasena), cuenta.id]
     )
-    return { ...serializarRelay(actualizada), contrasena }
+    return { ...(await serializarRelay(actualizada)), contrasena }
   })
 
   app.patch('/api/loc/relay', guard, async (req, reply) => {

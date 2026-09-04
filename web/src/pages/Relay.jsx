@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api } from '../api.js'
-import { Aviso, Boton, Confirmar, Copiar, Interruptor, Select, Spinner } from '../components/ui.jsx'
+import { api, fmtFecha } from '../api.js'
+import { Aviso, Badge, Boton, Confirmar, Copiar, Interruptor, Select, Spinner } from '../components/ui.jsx'
 
 const TARJETA = 'bg-card border border-border rounded-2xl p-5'
 
@@ -19,11 +19,106 @@ const Dato = ({ etiqueta, valor, mono = true }) => (
   </div>
 )
 
+// Estado del servidor y de su certificado a partir de GET /api/loc/relay (SPEC §13.3).
+// `tls_ok` ausente = backend sin la sección 13 desplegada: no se pinta badge ni aviso de TLS.
+// `tls_error` es opcional: sin él, un certificado no válido se enseña como «en emisión», que es
+// lo que pasa nada más arrancar (el relay levanta con autofirmado y pide el de Let's Encrypt).
+function estadoCertificado(datos) {
+  if (datos.servidor_activo === false) return { clave: 'apagado' }
+  if (datos.tls_ok == null) return { clave: 'desconocido' }
+  if (datos.tls_ok) return { clave: 'ok', validoHasta: datos.tls_valido_hasta || null }
+  if (datos.tls_error) return { clave: 'error', error: String(datos.tls_error) }
+  return { clave: 'pendiente' }
+}
+
+function BadgeCertificado({ estado }) {
+  switch (estado.clave) {
+    case 'ok':
+      return (
+        <Badge estado="ok" titulo="Certificado del servidor emitido por Let's Encrypt">
+          TLS válido{estado.validoHasta ? ` hasta ${fmtFecha(estado.validoHasta)}` : ''}
+        </Badge>
+      )
+    case 'pendiente':
+      return (
+        <Badge estado="pendiente" titulo="La app está pidiendo el certificado a Let's Encrypt">
+          Certificado en emisión · espera un minuto
+        </Badge>
+      )
+    case 'error':
+      return (
+        <Badge estado="error" titulo={estado.error}>
+          Certificado con error
+        </Badge>
+      )
+    case 'apagado':
+      return <Badge estado="inactivo">Servidor apagado</Badge>
+    default:
+      return null
+  }
+}
+
+function AvisoServidor({ estado, host, activado, onRecargar, recargando }) {
+  switch (estado.clave) {
+    case 'apagado':
+      return (
+        <Aviso variant="warn">
+          El servidor del relay está apagado ahora mismo a nivel de plataforma: si pegas estos datos en GHL te dará un
+          error de conexión. Escríbele a tu agencia para que lo active; tus datos seguirán siendo los mismos.
+        </Aviso>
+      )
+    case 'pendiente':
+      return (
+        <Aviso variant="warn" titulo="Servidor encendido · certificado pendiente">
+          La app está emitiendo el certificado TLS de <code className="text-ink">{host}</code>. Suele tardar menos de un
+          minuto: recarga en un momento. Si pegas los datos en GHL antes de que termine, la conexión segura puede
+          fallar la primera vez; vuelve a guardar cuando el certificado esté en verde.
+          <div className="mt-2">
+            <Boton variant="ghost" size="sm" onClick={onRecargar} cargando={recargando}>
+              Recargar
+            </Boton>
+          </div>
+        </Aviso>
+      )
+    case 'error':
+      return (
+        <Aviso variant="error" titulo="Servidor encendido · el certificado TLS ha fallado">
+          No se ha podido emitir el certificado de <code className="text-ink">{host}</code>
+          {estado.error ? (
+            <>
+              : <span className="font-mono text-xs break-all">{estado.error}</span>
+            </>
+          ) : (
+            '.'
+          )}{' '}
+          Avisa a tu agencia: lo ve y lo relanza desde su panel. Mientras tanto, GHL puede rechazar la conexión
+          segura al guardar el servicio.
+          <div className="mt-2">
+            <Boton variant="ghost" size="sm" onClick={onRecargar} cargando={recargando}>
+              Recargar
+            </Boton>
+          </div>
+        </Aviso>
+      )
+    case 'ok':
+      return (
+        <Aviso variant="ok">
+          Todo correcto: el servidor del relay está encendido y su certificado TLS es válido
+          {estado.validoHasta ? ` hasta el ${fmtFecha(estado.validoHasta)}` : ''}.{' '}
+          {activado ? 'Puedes pegar los datos de abajo en GHL.' : 'Activa el relay para obtener tus datos SMTP.'}
+        </Aviso>
+      )
+    default:
+      return null
+  }
+}
+
 export default function Relay() {
   const [datos, setDatos] = useState(null)
   const [proveedores, setProveedores] = useState([])
   const [error, setError] = useState('')
   const [ocupado, setOcupado] = useState(false)
+  const [recargando, setRecargando] = useState(false)
   const [password, setPassword] = useState('') // solo en memoria: se muestra una única vez
   const [aRotar, setARotar] = useState(false)
 
@@ -37,6 +132,15 @@ export default function Relay() {
       setDatos({})
     }
   }, [])
+
+  const recargar = useCallback(async () => {
+    setRecargando(true)
+    try {
+      await cargar()
+    } finally {
+      setRecargando(false)
+    }
+  }, [cargar])
 
   useEffect(() => {
     cargar()
@@ -101,7 +205,10 @@ export default function Relay() {
 
   const activado = Boolean(datos.username)
   const host = datos.host || '—'
+  // `port` es el puerto PÚBLICO (587 por defecto); `puerto_ssl` solo llega si la escucha SSL existe.
   const puerto = datos.port ?? '—'
+  const puertoSsl = datos.puerto_ssl ?? null
+  const estadoTls = estadoCertificado(datos)
 
   return (
     <div className="space-y-6">
@@ -115,12 +222,7 @@ export default function Relay() {
 
       {error && <Aviso variant="error">{error}</Aviso>}
 
-      {datos.servidor_activo === false && (
-        <Aviso variant="warn">
-          El servidor del relay está apagado ahora mismo a nivel de plataforma: si pegas estos datos en GHL te dará un
-          error de conexión. Escríbele a tu agencia para que lo active; tus datos seguirán siendo los mismos.
-        </Aviso>
-      )}
+      <AvisoServidor estado={estadoTls} host={host} activado={activado} onRecargar={recargar} recargando={recargando} />
 
       {!activado ? (
         <div className={TARJETA}>
@@ -169,8 +271,9 @@ export default function Relay() {
             </div>
 
             <div className="grid sm:grid-cols-2 gap-3">
-              <Dato etiqueta="Servidor SMTP" valor={host} />
-              <Dato etiqueta="Puerto" valor={puerto} />
+              <Dato etiqueta="Servidor SMTP (host)" valor={host} />
+              <Dato etiqueta={puertoSsl != null ? 'Puerto · TLS/STARTTLS · recomendado' : 'Puerto · TLS/STARTTLS'} valor={puerto} />
+              {puertoSsl != null && <Dato etiqueta="Puerto · SSL" valor={puertoSsl} />}
               <Dato etiqueta="Usuario" valor={datos.username} />
               <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5">
                 <div className="text-[11px] text-mut uppercase tracking-wide mb-1">Contraseña</div>
@@ -189,6 +292,16 @@ export default function Relay() {
                 </div>
               </div>
             </div>
+
+            {estadoTls.clave !== 'desconocido' && (
+              <div className="flex flex-wrap items-center gap-2 mt-3 text-[11px] text-mut">
+                <span>Certificado TLS del servidor:</span>
+                <BadgeCertificado estado={estadoTls} />
+                {estadoTls.clave === 'ok' && (
+                  <span>Se renueva solo. Con {puerto} usa TLS/STARTTLS{puertoSsl != null ? `; con ${puertoSsl}, SSL` : ''}.</span>
+                )}
+              </div>
+            )}
           </div>
 
           <div className={TARJETA}>
@@ -260,19 +373,28 @@ export default function Relay() {
               que lo verás en GHL (por ejemplo «Emails Disruptivo»). En{' '}
               <strong className="text-ink">«Correo electrónico»</strong> pon un correo tuyo real (por ejemplo{' '}
               <code className="text-ink">hola@tudominio.com</code>): será el remitente por defecto, y luego puedes
-              cambiarlo en cada correo. El servidor, el puerto, el usuario y la contraseña son los de arriba, tal cual.
+              cambiarlo en cada correo.
             </span>
           </li>
           <li className="flex gap-3">
             <span className="grid place-items-center w-5 h-5 rounded-full bg-gold/15 text-gold text-[11px] shrink-0">3</span>
             <span>
-              Marca <strong className="text-ink">Default Provider</strong> para que la subcuenta envíe por aquí, y guarda.
+              En <strong className="text-ink">«Servidor SMTP»</strong> pega el host de arriba y en{' '}
+              <strong className="text-ink">«Puerto»</strong> el <code className="text-ink">{puerto}</code> con{' '}
+              <strong className="text-ink">TLS/STARTTLS</strong> — es el recomendado
+              {puertoSsl != null ? (
+                <>
+                  ; si tu GHL te ofrece SSL, también vale el <code className="text-ink">{puertoSsl}</code> con SSL
+                </>
+              ) : null}
+              . Usuario y contraseña, los de arriba tal cual.
             </span>
           </li>
           <li className="flex gap-3">
             <span className="grid place-items-center w-5 h-5 rounded-full bg-gold/15 text-gold text-[11px] shrink-0">4</span>
             <span>
-              Ya puedes usar el <strong className="text-ink">nodo de email de siempre</strong> en tus workflows. No tienes
+              Marca <strong className="text-ink">Default Provider</strong> para que la subcuenta envíe por aquí, y guarda.
+              Ya puedes usar el <strong className="text-ink">nodo de email de siempre</strong> en tus workflows; no tienes
               que cambiar nada más.
             </span>
           </li>
@@ -281,7 +403,10 @@ export default function Relay() {
         <p className="text-[11px] text-mut mt-3">
           Al guardar, GHL prueba la conexión con el servidor. Si te sale un error tipo{' '}
           <code className="text-ink2">ETIMEDOUT</code> o «CONN», el servidor del relay no está accesible en ese momento:
-          no es nada que hayas escrito mal — avisa a tu agencia para que lo encienda.
+          no es nada que hayas escrito mal — avisa a tu agencia para que lo encienda. Si el error habla del{' '}
+          <em>certificado</em> (<code className="text-ink2">CERT</code>, <code className="text-ink2">SELF_SIGNED</code>…),
+          es que todavía se está emitiendo: espera un minuto, recarga esta página y vuelve a guardar cuando el
+          certificado esté en verde.
         </p>
 
         <div className="border-t border-border mt-5 pt-5">

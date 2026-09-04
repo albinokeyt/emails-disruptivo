@@ -409,15 +409,22 @@ Dos cosas que hay que saber antes de vender esto a un cliente:
 
 ## 10. El SMTP del relay dentro de GHL
 
-Este paso es **por subcuenta** y solo tiene sentido si has publicado el puerto del relay (sección D
-de [DEPLOY.md](DEPLOY.md)). Es lo que permite seguir usando el **nodo nativo de email de GHL** sin
-perder el historial ni el estado de entrega.
+Este paso es **por subcuenta** y solo tiene sentido con el relay encendido (sección D de
+[DEPLOY.md](DEPLOY.md): unos pocos pasos, el certificado TLS lo lee la app del de Traefik). Es lo que permite
+seguir usando el **nodo nativo de email de GHL** sin perder el historial ni el estado de entrega.
 
 ### 10.1 Sacar las credenciales
 
 En el panel de la subcuenta (dentro de GHL) → **Relay** → **Activar**. La app genera un usuario y una
 contraseña. **La contraseña se muestra una sola vez**: cópiala ahora. Si se pierde, se rota desde esa
 misma pantalla y hay que volver a pegarla en GHL.
+
+La misma pantalla enseña el **host**, los **dos puertos públicos** (`587` TLS/STARTTLS y `465` SSL)
+y un badge con el estado del **certificado TLS** del servidor. El aviso de arriba te dice en qué
+punto está la plataforma: servidor apagado (avisa a la agencia), encendido pero certificado en
+emisión (espera un minuto y recarga: es lo normal justo después de un despliegue), o todo correcto.
+**Pega los datos en GHL solo cuando el badge esté en verde**; si no, GHL puede rechazar la conexión
+segura al guardar y hay que volver a intentarlo.
 
 Ahí mismo se configura el **proveedor por defecto** de la subcuenta, que es el que se usará con los
 remitentes nuevos que detecte el relay.
@@ -429,8 +436,8 @@ derecha). Proveedor: **Other**.
 
 | Campo (nombre literal en GHL) | Qué poner |
 |---|---|
-| **SMTP Host** | `smtp.tudominio.com` (el valor de `SMTP_RELAY_HOST`) |
-| **Port** | `587` con TLS/STARTTLS, o `465` con SSL |
+| **SMTP Host** | El host que enseña la pantalla *Relay*: por defecto el dominio de la app (p. ej. `ddemail.escaladoacelerado.es`), o el `SMTP_RELAY_HOST` que haya definido la agencia |
+| **Port** | **`587` con TLS/STARTTLS** (recomendado). También vale `465` con SSL. Son los puertos públicos que muestra la pantalla; nunca `2525`/`2465`, que son las escuchas internas del contenedor |
 | **Username** | El usuario que generó la app |
 | **Password / API Key** | La contraseña que se mostró una sola vez |
 | **From Name** | El nombre que quieras que se vea |
@@ -447,6 +454,12 @@ Y marca:
 > Tampoco hay ninguna fuente oficial que diga que **GHL valide las credenciales al guardar**: asume
 > que **no** lo hace. **Cómo verificarlo:** guarda y envía un correo de prueba desde *Conversations*;
 > los errores salen al pinchar el triángulo rojo del mensaje.
+
+Si al guardar o al enviar aparece un error que habla del **certificado** (`CERT`, `SELF_SIGNED`,
+`unable to verify`), el relay todavía está con el certificado autofirmado provisional: la emisión
+del de Let's Encrypt no ha terminado (espera un minuto y recarga la pantalla *Relay*) o ha fallado
+(la agencia lo ve en su panel → *Ajustes* → «Relay SMTP y certificado» y lo relanza desde ahí). Un
+`ETIMEDOUT` o `CONN`, en cambio, es que el puerto no está accesible: no es nada del certificado.
 
 **Orden de precedencia** que aplica GHL, por si el correo sale por otro sitio del que esperabas:
 
@@ -531,3 +544,7 @@ transaccionales). Los webhooks de entrega, rebote y spam no se ven afectados: si
       paso 11).
 - [ ] App instalada en una subcuenta de pruebas: entra el menú lateral, entra sola por SSO, y un
       workflow de prueba deja una fila en *Envíos* que llega a `entregado`.
+- [ ] *(Solo si usas el relay)* En admin → Ajustes el certificado está en «Válido hasta …»,
+      `openssl s_client -starttls smtp -connect <host>:587` devuelve `Verify return code: 0 (ok)`, y
+      el servicio SMTP guardado en la subcuenta de pruebas con el puerto `587` envía un correo desde
+      *Conversations* que aparece en *Envíos* con origen «Relay SMTP».

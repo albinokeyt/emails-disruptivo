@@ -12,7 +12,10 @@ import { redis } from './redis.js'
 import { verificarClaveCifrado } from './lib/crypto.js'
 import { asegurarActionSecret } from './lib/settings.js'
 import { rutasBaja } from './lib/tracking.js'
+import { asegurarCertificado, detenerRenovacion, motivoSinCertificado, programarRenovacion } from './lib/acme.js'
+import { detenerVigilanciaTraefik, vigilarCertificadoTraefik } from './lib/traefik.js'
 
+import acmeRoutes from './routes/acme.js'
 import oauthRoutes from './routes/oauth.js'
 import locationRoutes from './routes/location.js'
 import adminRoutes from './routes/admin.js'
@@ -89,6 +92,11 @@ await app.register(trackingRoutes)
 // sin registrarla Gmail y Yahoo recibirían un 404 en la baja y penalizarían la reputación del envío.
 await app.register(rutasBaja)
 
+// Reto ACME HTTP-01 del certificado del relay (SPEC §13.1). Va ANTES del estático y del respaldo
+// de SPA: si el index.html contestara a /.well-known/acme-challenge/<token>, Let's Encrypt leería
+// HTML en vez del reto y el certificado nunca se emitiría.
+await app.register(acmeRoutes)
+
 // ---------------------------------------------------------------------------
 // 5. Panel React compilado (web/dist) con respaldo de SPA.
 //
@@ -118,11 +126,14 @@ if (hayPanel) {
   app.log.warn('web/dist no existe: el panel no se sirve. Compílalo con "npm run build:web".')
 }
 
-// El respaldo de SPA solo puede tragarse rutas del panel: /api/* y /t/* tienen que seguir dando
-// 404 de verdad, o un webhook mal escrito recibiría un 200 con HTML y lo daría por bueno.
+// El respaldo de SPA solo puede tragarse rutas del panel: /api/*, /t/* y /.well-known/* tienen que
+// seguir dando 404 de verdad, o un webhook mal escrito recibiría un 200 con HTML y lo daría por
+// bueno (y una CA que pidiera un reto ACME inexistente leería el index del panel).
 app.setNotFoundHandler((req, reply) => {
   const url = req.raw.url || ''
-  const esApi = url.startsWith('/api/') || url === '/api' || url.startsWith('/t/')
+  const esApi =
+    url.startsWith('/api/') || url === '/api' || url.startsWith('/t/') ||
+    url.startsWith('/.well-known/') || url === '/.well-known'
   const esNavegacion = req.method === 'GET' || req.method === 'HEAD'
   if (esApi || !esNavegacion) {
     return reply.code(404).send({ error: 'Ruta no encontrada' })
@@ -176,27 +187,30 @@ function resolverFuncion(origen, nombres) {
   return null
 }
 
+/** Devuelve { mod, resultado } si el servicio arrancó, o null. Nunca lanza. */
 async function arrancarServicio({ etiqueta, candidatos, inicio, parada }) {
   try {
     const cargado = await cargarModulo(candidatos)
     if (!cargado) {
       app.log.error(`${etiqueta}: no se encontró su módulo (${candidatos.join(' | ')}); no se arranca`)
-      return
+      return null
     }
     const iniciar = resolverFuncion(cargado.mod, inicio)
     if (!iniciar) {
       app.log.error(`${etiqueta}: ${cargado.ruta} no exporta ninguna función de arranque (${inicio.join(', ')})`)
-      return
+      return null
     }
     const resultado = await iniciar(app.log, { log: app.log, config })
     const parar = resolverFuncion(cargado.mod, parada) || resolverFuncion(resultado, parada)
     if (parar) paradas.push({ etiqueta, parar })
     else app.log.warn(`${etiqueta}: sin función de parada; el cierre ordenado no podrá esperarlo`)
     app.log.info(`${etiqueta}: en marcha (${cargado.ruta})`)
+    return { mod: cargado.mod, resultado }
   } catch (err) {
     // que no arranque un proceso de fondo NO tumba la API: los mensajes esperan en la cola de
     // `messages`, que es persistente, y salen en cuanto vuelva a haber un worker vivo
     app.log.error({ err }, `${etiqueta}: no se pudo arrancar`)
+    return null
   }
 }
 
@@ -215,6 +229,83 @@ const arrancarRelay = () =>
     inicio: ['iniciarRelay', 'arrancarRelay', 'startRelay', 'iniciarPasarela', 'arrancarPasarela', 'iniciar', 'arrancar', 'start'],
     parada: ['pararRelay', 'detenerRelay', 'stopRelay', 'pararPasarela', 'detenerPasarela', 'parar', 'detener', 'stop', 'cerrar'],
   })
+
+// ---------------------------------------------------------------------------
+// 7b. Certificado TLS automático del relay (SPEC §13.1).
+//
+// El relay ya está escuchando con lo que tenga (ficheros o autofirmado). Aquí, SIN esperar a nada
+// y con la precedencia ficheros > traefik > ACME > autofirmado:
+//   · modo traefik (SMTP_RELAY_TRAEFIK_ACME): src/lib/traefik.js lee el certificado que Traefik ya
+//     tiene y renueva para el host, y vigila el fichero para recoger sus renovaciones. Es el modo
+//     de EasyPanel, donde el reto HTTP-01 propio no llega a la app. Cero llamadas a la CA.
+//   · ACME propio: src/lib/acme.js devuelve el guardado en tls_certificates al instante o lo emite
+//     por HTTP-01 y tarda lo que tarde Let's Encrypt; después renueva cada 12 h.
+// Cuando el certificado llega se aplica en caliente con actualizarCertificado({ key, cert, origen })
+// del relay, sin reiniciar nada. Nada de esto bloquea el listen HTTP ni el arranque de la pasarela.
+// Solo se llama cuando la pasarela ha abierto al menos un puerto: un certificado para un relay que
+// no escucha es gastar cuota de la CA para nada.
+// ---------------------------------------------------------------------------
+function arrancarCertificadoRelay(relay) {
+  const { tlsAuto, tlsCert, tlsKey, traefikAcme, host } = config.relay
+  if (tlsCert && tlsKey) {
+    app.log.info('relay: certificado TLS de ficheros (SMTP_RELAY_TLS_CERT/_KEY); no se usa Traefik ni ACME')
+    return
+  }
+  if (!traefikAcme && !tlsAuto) {
+    app.log.warn('relay: SMTP_RELAY_TLS_AUTO=false, sin SMTP_RELAY_TRAEFIK_ACME y sin ficheros de certificado: se queda con el autofirmado')
+    return
+  }
+  const aplicar = resolverFuncion(relay?.mod, ['actualizarCertificado', 'updateCertificate', 'aplicarCertificado'])
+  if (!aplicar) {
+    app.log.error('relay: el módulo de la pasarela no exporta actualizarCertificado(); el certificado no se podrá aplicar en caliente')
+    return
+  }
+
+  // actualizarCertificado del relay no lanza: devuelve { aplicado, error }. Se comprueba para no
+  // anunciar como aplicado un certificado que la pasarela rechazó, y se devuelve tal cual para que
+  // quien lo llama (la vigilancia de Traefik) sepa si tiene que reintentar.
+  const origen = traefikAcme ? 'traefik' : 'acme'
+  const etiqueta = traefikAcme ? 'de Traefik' : 'ACME'
+  const aplicarCertificado = async ({ key, cert, expiresAt }) => {
+    const resultado = await aplicar({ key, cert, expiresAt, origen }, app.log)
+    if (resultado && resultado.aplicado === false) {
+      app.log.warn({ motivo: resultado.error || null }, `relay: el certificado ${etiqueta} no se pudo aplicar en caliente`)
+      return resultado
+    }
+    // la pasarela ya escribe «certificado … aplicado, válido hasta …» cuando devuelve aplicado:true;
+    // solo se repite aquí si la función no informa de nada
+    if (resultado?.aplicado === true) return resultado
+    const hasta = expiresAt instanceof Date ? expiresAt.toISOString() : String(expiresAt || '')
+    app.log.info(`relay: certificado ${etiqueta} aplicado, válido hasta ${hasta}`)
+    return resultado ?? { aplicado: true, error: null }
+  }
+
+  if (traefikAcme) {
+    app.log.info({ ruta: traefikAcme, host }, 'relay: certificado en modo traefik: se lee del acme.json de Traefik y se sigue su renovación; no se llama a la CA')
+    vigilarCertificadoTraefik({ log: app.log, alCambiar: aplicarCertificado })
+    return
+  }
+
+  // en segundo plano: asegurarCertificado nunca lanza; el catch cubre solo a actualizarCertificado
+  asegurarCertificado(host, { log: app.log })
+    .then(async (certificado) => {
+      if (!certificado) {
+        const motivo = motivoSinCertificado(host)
+        app.log.warn(
+          { motivo },
+          motivo === 'lock'
+            ? 'relay: sin certificado ACME por ahora (lock de emisión ocupado, quizá de un redespliegue); se reintenta en cuanto caduque'
+            : 'relay: sin certificado ACME por ahora; sigue con el autofirmado y se reintentará (ver Ajustes › Relay SMTP)'
+        )
+        return
+      }
+      await aplicarCertificado(certificado)
+    })
+    .catch((err) => app.log.error({ err }, 'relay: no se pudo aplicar el certificado ACME en caliente'))
+    .finally(() => {
+      programarRenovacion({ log: app.log, alRenovar: aplicarCertificado })
+    })
+}
 
 // ---------------------------------------------------------------------------
 // 8. Cierre ordenado. Node es PID 1 en el contenedor: sin manejador ignoraría el SIGTERM de cada
@@ -236,6 +327,10 @@ async function apagar(senal) {
     process.exit(1)
   }, PLAZO_CIERRE_MS)
   plazo.unref()
+
+  // la comprobación periódica del certificado no debe arrancar una emisión a mitad del apagado
+  detenerRenovacion()
+  detenerVigilanciaTraefik()
 
   for (const { etiqueta, parar } of paradas.splice(0)) {
     try {
@@ -303,8 +398,15 @@ try {
   await app.listen({ port: config.port, host: '0.0.0.0' })
 
   if (config.worker.habilitado) await arrancarWorker()
-  if (config.relay.habilitado) await arrancarRelay()
-  else app.log.info('pasarela SMTP desactivada (SMTP_RELAY_ENABLED=false)')
+  if (config.relay.habilitado) {
+    const relay = await arrancarRelay()
+    // resultado null = la pasarela no abrió ningún puerto (ocupado, sin permisos…): sin escuchas no
+    // hay a qué aplicar un certificado, y pedirlo a la CA sería gastar cuota para nada
+    if (relay?.resultado) arrancarCertificadoRelay(relay)
+    else if (relay) app.log.warn('relay: sin escuchas abiertas; no se gestiona el certificado TLS hasta el próximo arranque')
+  } else {
+    app.log.info('pasarela SMTP desactivada (SMTP_RELAY_ENABLED=false)')
+  }
 } catch (err) {
   app.log.error({ err }, 'fallo en el arranque')
   process.exit(1)

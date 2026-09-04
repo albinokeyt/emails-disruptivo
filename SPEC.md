@@ -514,3 +514,160 @@ con explicación llana; botón «Activar DND a todos los pendientes» (muestra p
 botón «Descargar CSV»; tabla con email, fecha, motivo (`source`), badge de DND (verde con fecha /
 gris pendiente / rojo con error), botón «Ficha en GHL» y botón «Activar DND» por fila.
 `App.jsx` y `Layout.jsx` añaden la ruta y la entrada de menú. `api.js` añade las funciones.
+
+---
+
+## 13. Relay sin fricción: certificado TLS automático y doble puerto
+
+Contexto real: la app ya está desplegada en `https://ddemail.escaladoacelerado.es` y funciona dentro
+de GHL. El relay estaba apagado porque la guía exigía conseguir un certificado a mano (DNS-01,
+volúmenes, sidecar). Esta sección elimina esa fricción: **el relay obtiene y renueva solo su
+certificado Let's Encrypt** para el host del relay, sin tocar nada a mano.
+
+**Hecho comprobado en el despliegue real (EasyPanel):** el reto ACME HTTP-01 lanzado desde la app
+**no funciona** detrás de Traefik con ACME. Traefik atiende el puerto 80 y su propio manejador ACME
+captura `/.well-known/acme-challenge/` para **todos** los hosts (responde `404` vacío, sin
+`Content-Type`) con prioridad máxima, antes de enrutar nada a la app; dar de alta el host en
+*Domains* no lo cambia. Let's Encrypt valida HTTP-01 por el 80, así que la validación falla siempre.
+Por eso el modo principal es **leer el certificado que Traefik ya tiene** para ese host; el HTTP-01
+propio queda como ruta genérica para despliegues sin un proxy con ACME delante.
+
+### 13.1 Origen del certificado: ficheros > Traefik > ACME propio > autofirmado
+
+**Modo `traefik` (el de EasyPanel, recomendado).** Traefik emite y renueva solo el certificado de
+cada dominio dado de alta en *Domains* y lo guarda en su `acme.json` (en el VPS, normalmente
+`/etc/easypanel/traefik/acme.json`; se comprueba en D). Con ese fichero montado en el contenedor en
+solo lectura y `SMTP_RELAY_TRAEFIK_ACME=/certs/acme.json`, la app lee de ahí el certificado del host
+del relay y **nunca llama a la CA**.
+
+- Módulo `src/lib/traefik.js`:
+  - `leerCertificadoTraefik(ruta, hostname)` → `{ key, cert, expiresAt, resolver, origen: 'traefik' }`.
+    Parsea el JSON (Traefik v2/v3: `<resolver>.Certificates[].domain.main/sans`, `certificate` y
+    `key` en base64; se admite también la forma v1), casa el host (incluidos comodines de una
+    etiqueta), valida clave+certificado y se queda con el que más dura. Lanza con un mensaje apto
+    para el panel (fichero ausente = revisar el Mount, host ausente = darlo de alta en *Domains*,
+    JSON roto, certificado caducado…). Jamás registra el contenido del fichero (lleva la clave de
+    la cuenta ACME de Traefik).
+  - `vigilarCertificadoTraefik({ log, alCambiar })`: lectura inmediata, relectura cuando el fichero
+    cambia (`fs.watch` sobre el directorio, con espera de 3 s) y comprobación cada 12 h (cada 5 min
+    mientras no haya certificado utilizable). Llama a `alCambiar(certificado)` solo cuando cambia
+    la huella; si quien aplica devuelve `{ aplicado:false }` lo reintenta en la siguiente vuelta.
+    Exporta también `comprobarCertificadoTraefik({ forzar })`, `detenerVigilanciaTraefik()` y
+    `estadoTraefik()` → `{ configurado, ruta, hostname, ultima_lectura, ultimo_error, valido_hasta, resolver }`.
+
+**Modo `acme` (HTTP-01 desde la app).** Solo para despliegues en los que el puerto 80 del host
+entrega la petición del reto a la app (proxy sin ACME, o sin proxy).
+
+- Dependencia: `acme-client`.
+- Host del certificado: `SMTP_RELAY_HOST` (por defecto el hostname de `APP_BASE_URL`).
+- Ruta HTTP `GET /.well-known/acme-challenge/:token` en `src/routes/acme.js`, registrada en
+  `index.js` **antes** del estático y del fallback SPA. Lee el `keyAuthorization` de Redis
+  (`acme:challenge:<token>`, TTL 10 min); 404 **con texto y `Content-Type`** si no existe (esa firma
+  es la que distingue a la app de un proxy que captura la ruta).
+- Módulo `src/lib/acme.js`:
+  - `asegurarCertificado(hostname, { log, forzar })` → `{ key, cert, expiresAt, origen }`. Si en
+    `tls_certificates` hay un certificado con más de 30 días de vida, lo devuelve; si no, emite o
+    renueva contra Let's Encrypt (directorio de producción; `ACME_DIRECTORY` permite staging para
+    pruebas; `ACME_EMAIL` opcional como contacto). Serializado con lock Redis `acme:lock:<host>`
+    (TTL 5 min) para que dos instancias no emitan a la vez. Guarda claves cifradas con `lib/crypto`,
+    `issued_at`, `expires_at`; ante fallo guarda `last_error` + `last_attempt_at` y **no** lanza:
+    devuelve `null` para que el relay arranque igualmente con autofirmado.
+    `motivoSinCertificado(hostname)` → `'host'|'cuota'|'lock'|'error'|'fallo'|null` explica el
+    último `null`.
+  - **Autocomprobación del reto antes de pedir la validación:** la app pide su propia URL del reto.
+    Si obtiene la firma del ACME de Traefik (404 vacío sin `Content-Type`) **aborta antes de
+    `completeChallenge`** (no gasta validaciones fallidas de LE) y deja en `last_error` el motivo
+    real («el puerto 80 de `<host>` lo atiende el ACME de Traefik: usa el modo traefik»). Cualquier
+    otro fallo de la autocomprobación (timeout, DNS) es solo informativo, porque puede ser del
+    contenedor y no de lo que verá la CA.
+  - Clave de cuenta ACME: se reutiliza siempre; si la guardada no se puede descifrar
+    (`ENCRYPTION_KEY` rotada sin la vieja) se **reemplaza** en vez de conservarla, para no crear una
+    cuenta nueva en LE en cada emisión.
+  - `estadoCertificado(hostname)` → `{ hostname, valido: bool, issued_at, expires_at, last_error,
+    last_attempt_at, dias_restantes, emitiendo }`.
+  - `programarRenovacion({ log, alRenovar })`: comprobación cada 12 h; renueva si quedan < 30 días
+    y llama a `alRenovar({ key, cert })`. Sin certificado se comprueba cada hora, salvo que el
+    motivo sea el lock de otra instancia (o uno huérfano de un redespliegue a mitad de emisión):
+    entonces en cuanto el lock caduca (5 min + 30 s). Exporta también `detenerRenovacion()`.
+  - Anti-abuso de Let's Encrypt: no reintentar más de una vez por hora tras un error
+    (`last_attempt_at`), para no agotar las cuotas de LE en bucle.
+
+**Común a los dos modos.**
+
+- Precedencia en el relay: ficheros `SMTP_RELAY_TLS_CERT/_KEY` (manual) > Traefik
+  (`SMTP_RELAY_TRAEFIK_ACME`) > ACME propio (`SMTP_RELAY_TLS_AUTO`, **por defecto true**) >
+  autofirmado de smtp-server. Con `SMTP_RELAY_TRAEFIK_ACME` definido no se intenta ACME aunque
+  `SMTP_RELAY_TLS_AUTO` sea true. Toda la configuración del relay sale de `config.relay`
+  (`src/config.js`): la pasarela y el panel leen el mismo objeto y no pueden discrepar.
+- Arranque **no bloqueante**: el relay levanta al instante con lo que tenga (ficheros o
+  autofirmado); `src/index.js` lanza en segundo plano la vigilancia de Traefik o
+  `asegurarCertificado`, y cuando llega el certificado lo aplica en caliente con
+  `actualizarCertificado({ key, cert, expiresAt, origen })` → `server.updateSecureContext` de
+  smtp-server en **todas** las escuchas. El log lo dice claro: `relay: certificado de Traefik
+  aplicado, válido hasta …` / `relay: certificado ACME aplicado, válido hasta …`. Solo se gestiona
+  el certificado si la pasarela abrió al menos un puerto.
+- Un certificado rechazado (inválido, caducado) **no** pisa el estado del que ya está en servicio:
+  queda en `tls.ultimo_rechazo` y `tls.error` sigue en `null` mientras sirva uno real.
+
+### 13.2 Doble puerto y puertos públicos
+
+GHL documenta 587 (TLS/STARTTLS) y 465 (SSL). Se ofrecen los dos:
+
+| Variable | Def. | Para qué |
+|---|---|---|
+| `SMTP_RELAY_PORT` | `2525` | escucha STARTTLS dentro del contenedor |
+| `SMTP_RELAY_PORT_SSL` | `2465` | escucha TLS implícito (secure) dentro del contenedor; sin definir = 2465; vacía o `0/false/no/off` = no se levanta |
+| `SMTP_RELAY_PUBLIC_PORT` | `587` | puerto que EasyPanel publica hacia `SMTP_RELAY_PORT` y que el panel enseña al cliente |
+| `SMTP_RELAY_PUBLIC_PORT_SSL` | `465` | idem para el SSL |
+| `SMTP_RELAY_TRAEFIK_ACME` | — | modo traefik: ruta del `acme.json` de Traefik dentro del contenedor (`/certs/acme.json`) |
+| `SMTP_RELAY_TLS_AUTO` | `true` | emitir certificado por ACME HTTP-01 desde la app (solo sin modo traefik) |
+| `ACME_EMAIL` | — | contacto opcional de la cuenta ACME |
+| `ACME_DIRECTORY` | LE producción | URL del directorio ACME (staging para pruebas) |
+
+Las escuchas internas son puertos altos a propósito: el contenedor no necesita privilegios para
+abrirlos y EasyPanel los publica como `587 → 2525` y `465 → 2465` (TCP). Ambas escuchas comparten
+auth, handler, límites y certificado. `estadoRelay()` del relay devuelve
+`{ activo, host, puertos: { starttls, ssl }, tls: { modo: 'acme'|'traefik'|'ficheros'|'autofirmado',
+valido_hasta, error, ultimo_rechazo, hostname } }`; los puertos son los **públicos**, y `ssl` es
+`null` si la escucha SSL no está configurada o no llegó a abrirse. `SMTP_RELAY_ENABLED` admite los
+mismos verdaderos que el resto de booleanos (`1/true/si/yes/on`).
+
+### 13.3 Contrato HTTP nuevo
+
+| Método | Ruta | Auth | Notas |
+|---|---|---|---|
+| GET | `/.well-known/acme-challenge/:token` | — | reto HTTP-01 |
+| GET | `/api/admin/relay` | admin | `{ relay, certificado, traefik }`: `estadoRelay()` + `puertos_internos { starttls, ssl }` + `origen_certificado` (`'ficheros'|'traefik'|'acme'|'ninguno'`); `certificado` = `estadoCertificado()` solo con ACME propio; `traefik` = `estadoTraefik()` solo en modo traefik. `relay.tls.error` se completa con el motivo del módulo que obtiene el certificado |
+| POST | `/api/admin/relay/certificado` | admin | modo traefik: relee el `acme.json` y aplica → `{ ok, aplicado, detalle, mensaje, traefik, relay }`. ACME propio: fuerza emisión/renovación (respeta lock y cuota de 1/h; la renovación forzada de un certificado con ≥ 30 días exige 48 h desde su emisión y un freno `acme:forzado:<host>` de 1 h en Redis, por el límite de 5 duplicados/semana de LE) → `{ ok, estado, aplicado, detalle, relay }`. Con ficheros o sin origen → `{ ok:false, error }` sin tocar la CA. `aplicado:false` + `detalle` cuando se obtuvo pero la pasarela de esta instancia no lo aplicó |
+
+`GET /api/loc/relay` añade `puerto_ssl`, `tls_ok` (bool), `tls_valido_hasta`, `tls_modo` y
+`tls_error`; `port` pasa a ser el **público** (`SMTP_RELAY_PUBLIC_PORT`), nunca el interno.
+`servidor_activo` refleja si la pasarela de esta instancia tiene escuchas abiertas de verdad (un
+relay habilitado que no pudo abrir puertos se enseña como apagado); solo sin pasarela cargada se
+recurre a la configuración.
+
+### 13.4 Pantallas
+
+- `Relay.jsx`: enseña host, **dos** puertos con su etiqueta («587 · TLS/STARTTLS» y «465 · SSL», el
+  segundo solo si está configurado), usuario y contraseña como hasta ahora, y un badge de
+  certificado: verde «TLS válido hasta …», ámbar «certificado en emisión, espera un minuto», rojo
+  con el error. El aviso superior distingue: relay apagado a nivel de plataforma / encendido pero
+  certificado pendiente / todo correcto. Las instrucciones para GHL ya con los puertos públicos.
+- `Ajustes.jsx` (admin): tarjeta «Relay SMTP y certificado» con el estado completo: origen del
+  certificado, modo TLS en servicio, puertos públicos y escuchas internas por separado, último
+  error (y, aparte, el último certificado rechazado si el que sirve sigue bien), y el botón
+  «Emitir / renovar ahora» («Releer de Traefik ahora» en modo traefik; deshabilitado con ficheros).
+  Si la respuesta trae `aplicado:false`, aviso ámbar con `detalle` en vez del verde.
+
+### 13.5 Guía de despliegue (sección D de DEPLOY.md, reescrita)
+
+Sigue siendo corta: (1) comprobar en el VPS la ruta del `acme.json` de Traefik y que contiene el
+host de la app; (2) EasyPanel → servicio `emails` → **Mounts**: bind mount de solo lectura de ese
+directorio a `/certs`; (3) variables `SMTP_RELAY_ENABLED=true`, `SMTP_RELAY_TRAEFIK_ACME=/certs/acme.json`,
+`SMTP_RELAY_PORT_SSL=2465`; (4) **Ports**: `587 → 2525` TCP y `465 → 2465` TCP; (5) comprobar con el
+proveedor del VPS que 587/465 no están bloqueados; (6) redesplegar y ver en Ajustes cómo el
+certificado pasa a «válido»; (7) verificar desde fuera con `openssl s_client -starttls smtp -connect
+host:587` y `Verify return code: 0 (ok)`. El HTTP-01 propio queda documentado como alternativa para
+despliegues sin Traefik/ACME delante; el DNS-01 con ficheros, para un host que no enrute a este
+servidor. **No se activa `SMTP_RELAY_ENABLED` en EasyPanel sin `SMTP_RELAY_TRAEFIK_ACME`** (o
+ficheros): con ACME propio el relay se quedaría con el autofirmado que GHL rechaza.
