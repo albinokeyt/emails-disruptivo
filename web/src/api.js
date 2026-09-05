@@ -98,6 +98,7 @@ export const crearProveedor = (datos) => api.post('/api/loc/proveedores', datos)
 export const actualizarProveedor = (id, datos) => api.patch(`/api/loc/proveedores/${id}`, datos)
 export const eliminarProveedor = (id) => api.del(`/api/loc/proveedores/${id}`)
 export const probarProveedor = (id) => api.post(`/api/loc/proveedores/${id}/probar`)
+export const registrarWebhookProveedor = (id) => api.post(`/api/loc/proveedores/${id}/webhook`)
 
 export const listarRemitentes = () => api.get('/api/loc/remitentes')
 export const crearRemitente = (datos) => api.post('/api/loc/remitentes', datos)
@@ -177,6 +178,7 @@ export const adminCrearProveedor = (datos) => api.post('/api/admin/proveedores',
 export const adminActualizarProveedor = (id, datos) => api.patch(`/api/admin/proveedores/${id}`, datos)
 export const adminEliminarProveedor = (id) => api.del(`/api/admin/proveedores/${id}`)
 export const adminProbarProveedor = (id) => api.post(`/api/admin/proveedores/${id}/probar`)
+export const registrarWebhookProveedorAdmin = (id) => api.post(`/api/admin/proveedores/${id}/webhook`)
 
 export const adminListarAsignaciones = (proveedorId) => api.get(`/api/admin/proveedores/${proveedorId}/asignaciones`)
 export const adminAsignarProveedor = (proveedorId, locationId) =>

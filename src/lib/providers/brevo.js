@@ -16,8 +16,31 @@ const MAX_DESTINATARIOS = 99 // límite de Brevo por mensaje (con adjuntos baja 
 const MAX_NOMBRE = 70 // límite documentado del nombre visible
 const MAX_ESPERA_MS = 3_600_000
 
+// Webhook transaccional que la app registra sola en Brevo (POST /v3/webhooks). Los nombres van en
+// camelCase, que es el enum de CREACIÓN (el payload luego llega en snake_case y lo mapea
+// src/routes/webhooks.js). Estos son los OBLIGATORIOS: a un webhook existente al que le falte
+// alguno se le completan con PUT.
+const EVENTOS_WEBHOOK = Object.freeze([
+  'delivered', 'hardBounce', 'softBounce', 'blocked', 'spam', 'invalid', 'deferred',
+  'opened', 'uniqueOpened', 'click', 'unsubscribed',
+])
+// `error` no aparece en el enum documentado de la API: se pide, pero si Brevo lo rechaza (400) se
+// reintenta sin él, y NO cuenta como «evento que falta» al revisar un webhook ya existente. Si
+// contara, cada guardado repetiría el PUT (y su 400) para nada y gastaría el cupo de /v3/webhooks.
+const EVENTOS_WEBHOOK_OPCIONALES = Object.freeze(['error'])
+const DESCRIPCION_WEBHOOK = 'Emails Disruptivo'
+// El registro del webhook ocurre dentro de la petición de guardar el proveedor: tiempos cortos.
+const TIEMPO_WEBHOOK_MS = 10_000
+
 const texto = (v) => (v === undefined || v === null ? '' : String(v)).trim()
 const limpiar = (v, max = 400) => texto(v).replace(/[\r\n\t]+/g, ' ').slice(0, max)
+// Los mensajes de error de Brevo se enseñan en el panel y se guardan en providers (last_error,
+// config.webhook.error): por si alguna respuesta llegara a repetir la clave, se tapa antes de usarla.
+const sinClave = (v) => texto(v).replace(/xkeysib-[\w-]+/gi, '[clave oculta]')
+// Brevo devuelve los eventos con el nombre con el que se crearon (camelCase), pero se comparan sin
+// mayúsculas ni separadores (hardBounce == hard_bounce) para no forzar un PUT en cada guardado si
+// algún día los devolviera de otra forma.
+const claveEvento = (e) => texto(e).toLowerCase().replace(/[^a-z]/g, '')
 
 /** Error normalizado del proveedor: `permanente` decide si el worker reintenta o no. */
 function errorProveedor(mensaje, opciones = {}) {
@@ -67,7 +90,7 @@ function cabecerasBrevo(cabeceras) {
 function errorDeRespuesta(respuesta, datos, cuerpoTexto) {
   const estado = respuesta.status
   const codigoBrevo = texto(datos?.code)
-  const mensajeBrevo = limpiar(datos?.message || (typeof cuerpoTexto === 'string' ? cuerpoTexto : ''))
+  const mensajeBrevo = limpiar(sinClave(datos?.message || (typeof cuerpoTexto === 'string' ? cuerpoTexto : '')))
   const sufijo = mensajeBrevo ? `: ${mensajeBrevo}` : ''
 
   if (estado === 429) {
@@ -143,6 +166,85 @@ async function peticion(ruta, opciones = {}) {
   return { datos, respuesta }
 }
 
+/**
+ * Alta (POST) o actualización (PUT) del webhook. Si Brevo rechaza el cuerpo con un 400 y llevaba
+ * eventos opcionales, se reintenta sin ellos en vez de dejar al proveedor sin webhook.
+ */
+async function guardarWebhook(apiKey, ruta, metodo, cuerpo) {
+  const events = Array.isArray(cuerpo.events) ? cuerpo.events : []
+  const sinOpcionales = events.filter((e) => !EVENTOS_WEBHOOK_OPCIONALES.includes(e))
+  try {
+    return await peticion(ruta, { metodo, apiKey, cuerpo, timeoutMs: TIEMPO_WEBHOOK_MS })
+  } catch (err) {
+    if (err?.codigo !== 400 || sinOpcionales.length === events.length) throw err
+    return peticion(ruta, { metodo, apiKey, cuerpo: { ...cuerpo, events: sinOpcionales }, timeoutMs: TIEMPO_WEBHOOK_MS })
+  }
+}
+
+/**
+ * Garantiza que la cuenta de Brevo tiene registrado el webhook transaccional de la app en `url`.
+ * Es idempotente: la URL lleva un token derivado del id del proveedor, así que se busca por URL
+ * exacta y, si ya existe, se reutiliza (completando con PUT solo los eventos obligatorios que le
+ * falten); si no existe, se crea con POST /v3/webhooks. Nunca lanza: devuelve
+ * { ok, creado, id, detalle } con un mensaje legible (401 clave inválida, 429 cuota, red…) para
+ * que el panel lo enseñe. La clave de API no aparece jamás en el detalle.
+ */
+export async function asegurarWebhook(credenciales = {}, url) {
+  const destino = texto(url)
+  const apiKey = credenciales?.api_key
+  try {
+    if (!/^https?:\/\/\S+$/i.test(destino)) {
+      throw errorProveedor('La URL pública del webhook no es válida: revisa APP_BASE_URL', { permanente: true })
+    }
+
+    let lista = []
+    try {
+      const { datos } = await peticion('/webhooks?type=transactional', { apiKey, timeoutMs: TIEMPO_WEBHOOK_MS })
+      lista = Array.isArray(datos?.webhooks) ? datos.webhooks : []
+    } catch (err) {
+      // sin ningún webhook dado de alta Brevo puede responder 404: se trata como lista vacía
+      if (err?.codigo !== 404) throw err
+    }
+
+    const existente = lista.find((w) => texto(w?.url) === destino)
+    if (existente) {
+      const id = existente.id ?? null
+      const etiqueta = id != null ? ` (#${id})` : ''
+      const actuales = (Array.isArray(existente.events) ? existente.events : []).map(texto).filter(Boolean)
+      const tiene = new Set(actuales.map(claveEvento))
+      const faltan = EVENTOS_WEBHOOK.filter((e) => !tiene.has(claveEvento(e)))
+      // sin id no hay PUT posible (y un POST lo duplicaría): se da por bueno tal cual está
+      if (!faltan.length || id == null) {
+        return { ok: true, creado: false, id, detalle: `El webhook ya estaba registrado en Brevo${etiqueta}` }
+      }
+      // los opcionales solo se piden si aún no los tiene; si Brevo los rechaza, guardarWebhook reintenta sin ellos
+      const opcionales = EVENTOS_WEBHOOK_OPCIONALES.filter((e) => !tiene.has(claveEvento(e)))
+      await guardarWebhook(apiKey, `/webhooks/${encodeURIComponent(id)}`, 'PUT', {
+        url: destino,
+        description: DESCRIPCION_WEBHOOK,
+        events: [...actuales, ...faltan, ...opcionales],
+      })
+      return {
+        ok: true,
+        creado: false,
+        id,
+        detalle: `El webhook ya estaba registrado en Brevo${etiqueta}: se han añadido ${faltan.length} evento(s) que faltaban`,
+      }
+    }
+
+    const { datos } = await guardarWebhook(apiKey, '/webhooks', 'POST', {
+      url: destino,
+      description: DESCRIPCION_WEBHOOK,
+      events: [...EVENTOS_WEBHOOK, ...EVENTOS_WEBHOOK_OPCIONALES],
+      type: 'transactional',
+    })
+    const id = datos?.id ?? null
+    return { ok: true, creado: true, id, detalle: `Webhook registrado en Brevo${id != null ? ` (#${id})` : ''}` }
+  } catch (err) {
+    return { ok: false, creado: false, id: null, detalle: texto(err?.message) || 'No se pudo registrar el webhook en Brevo' }
+  }
+}
+
 export default {
   tipo: 'brevo',
 
@@ -159,6 +261,9 @@ export default {
 
   // No hay configuración no secreta: el endpoint y el host los pone la integración.
   camposConfig: [],
+
+  /** Registro automático del webhook transaccional (lo llama src/routes/location.js al guardar). */
+  asegurarWebhook,
 
   /** Comprueba la clave contra GET /v3/account. Nunca lanza: devuelve { ok, detalle, cuenta }. */
   async validar(credenciales = {}) {

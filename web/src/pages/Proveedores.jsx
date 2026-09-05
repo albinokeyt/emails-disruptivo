@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api } from '../api.js'
+import { api, registrarWebhookProveedor } from '../api.js'
 import {
   Aviso,
   Badge,
   Boton,
   Campo,
   Confirmar,
+  Copiar,
   Interruptor,
   Modal,
   Select,
@@ -66,6 +67,57 @@ function validar(f, esNuevo) {
   return errores
 }
 
+// Estado del webhook de Brevo (config.webhook lo escribe el servidor al guardar o al registrar) y
+// la URL manual como respaldo, por si hay que darlo de alta a mano en Brevo › Transactional › Webhooks.
+// Lo comparte ProveedoresAdmin.jsx.
+export function WebhookBrevo({ proveedor, registrando, onRegistrar }) {
+  const wh = proveedor.config?.webhook
+  const registrado = wh?.registrado === true
+  return (
+    <div className="mt-1.5 space-y-1">
+      <div className="flex items-center gap-2 flex-wrap">
+        {registrado ? (
+          <Badge
+            estado="verificado"
+            texto="Webhook registrado"
+            titulo={wh?.id != null ? `Webhook #${wh.id} en Brevo` : undefined}
+          />
+        ) : (
+          <Badge
+            estado="pendiente"
+            texto="Webhook pendiente"
+            titulo={wh?.error || 'Todavía no se ha registrado el webhook en Brevo'}
+          />
+        )}
+        {onRegistrar && (
+          <button
+            type="button"
+            className="text-[11px] text-gold hover:underline disabled:opacity-40"
+            disabled={registrando}
+            onClick={onRegistrar}
+          >
+            {registrando ? 'Registrando…' : 'Registrar webhook en Brevo'}
+          </button>
+        )}
+      </div>
+      {!registrado && wh?.error && (
+        <div className="text-[11px] text-bad max-w-64 truncate" title={wh.error}>
+          {wh.error}
+        </div>
+      )}
+      {proveedor.webhook_url && (
+        <div
+          className="flex items-center gap-1.5 text-[11px] text-mut"
+          title="URL del webhook, por si prefieres darlo de alta a mano en Brevo"
+        >
+          <span className="truncate max-w-56 font-mono">{proveedor.webhook_url}</span>
+          <Copiar texto={proveedor.webhook_url} soloIcono />
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Proveedores() {
   const [datos, setDatos] = useState(null)
   const [error, setError] = useState('')
@@ -77,6 +129,8 @@ export default function Proveedores() {
   const [prueba, setPrueba] = useState(null) // {id, ok, detalle}
   const [aBorrar, setABorrar] = useState(null)
   const [avisoBorrado, setAvisoBorrado] = useState('')
+  const [registrando, setRegistrando] = useState(null)
+  const [avisoWebhook, setAvisoWebhook] = useState(null) // {ok, detalle}
 
   const cargar = useCallback(async () => {
     try {
@@ -154,8 +208,11 @@ export default function Proveedores() {
 
     setGuardando(true)
     try {
-      if (esNuevo) await api.post('/api/loc/proveedores', cuerpo)
-      else await api.patch(`/api/loc/proveedores/${modal.id}`, cuerpo)
+      const r = esNuevo
+        ? await api.post('/api/loc/proveedores', cuerpo)
+        : await api.patch(`/api/loc/proveedores/${modal.id}`, cuerpo)
+      // el proveedor se guarda aunque Brevo no acepte el webhook: el aviso se enseña aparte
+      setAvisoWebhook(r?.aviso ? { ok: false, detalle: r.aviso } : null)
       setModal(null)
       await cargar()
     } catch (err) {
@@ -176,6 +233,20 @@ export default function Proveedores() {
       setPrueba({ id: p.id, ok: false, detalle: err.message })
     } finally {
       setProbando(null)
+    }
+  }
+
+  const registrarWebhook = async (p) => {
+    setRegistrando(p.id)
+    setAvisoWebhook(null)
+    try {
+      const d = await registrarWebhookProveedor(p.id)
+      setAvisoWebhook({ ok: d?.ok !== false, detalle: d?.detalle || 'Webhook registrado en Brevo.' })
+      await cargar()
+    } catch (err) {
+      setAvisoWebhook({ ok: false, detalle: err.message })
+    } finally {
+      setRegistrando(null)
     }
   }
 
@@ -235,6 +306,11 @@ export default function Proveedores() {
           {prueba.detalle}
         </Aviso>
       )}
+      {avisoWebhook && (
+        <Aviso variant={avisoWebhook.ok ? 'ok' : 'aviso'} onCerrar={() => setAvisoWebhook(null)}>
+          {avisoWebhook.detalle}
+        </Aviso>
+      )}
 
       <div className={TARJETA}>
         <div className="text-sm font-semibold mb-4">Tus proveedores</div>
@@ -255,7 +331,10 @@ export default function Proveedores() {
                       <span className="text-mut">({p.config?.secure ? 'SSL/TLS' : 'STARTTLS'})</span>
                     </span>
                   ) : (
-                    <span className="text-xs text-mut">Clave de API guardada</span>
+                    <>
+                      <span className="text-xs text-mut">Clave de API guardada</span>
+                      <WebhookBrevo proveedor={p} registrando={registrando === p.id} onRegistrar={() => registrarWebhook(p)} />
+                    </>
                   )}
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60">{filaEstado(p)}</td>

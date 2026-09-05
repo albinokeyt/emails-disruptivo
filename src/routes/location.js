@@ -334,6 +334,94 @@ export function urlWebhookDe(proveedor) {
 }
 
 /**
+ * Registra (o comprueba) en Brevo el webhook de un proveedor propio o de la agencia y deja el
+ * resultado en providers.config.webhook = { registrado, id, comprobado_en, error }. Nunca lanza:
+ * un fallo de Brevo no puede impedir guardar el proveedor, solo se devuelve como aviso.
+ * `prov` es la fila completa (hace falta credentials_enc). Devuelve { ok, creado, detalle, webhook, config }.
+ */
+export async function registrarWebhookProveedor(prov) {
+  const previo = prov?.config?.webhook && typeof prov.config.webhook === 'object' ? prov.config.webhook : {}
+  // Dos registros a la vez del mismo proveedor (guardar desde dos pestañas, guardar + botón) harían
+  // los dos el GET con la lista vacía y los dos el POST: Brevo acabaría con el webhook duplicado.
+  // Un cerrojo corto en Redis los serializa; sin Redis se sigue adelante (la búsqueda por URL ya
+  // cubre las llamadas consecutivas, que son el caso normal).
+  const cerrojo = `webhook:lock:${prov?.id}`
+  let conCerrojo = false
+  try {
+    conCerrojo = (await redis.set(cerrojo, '1', 'EX', 60, 'NX')) === 'OK'
+    if (!conCerrojo) {
+      return {
+        ok: false,
+        creado: false,
+        detalle: 'Ya hay un registro del webhook en curso para este proveedor: espera unos segundos y recarga',
+        webhook: {
+          registrado: previo.registrado === true,
+          id: previo.id ?? null,
+          comprobado_en: previo.comprobado_en ?? null,
+          error: previo.error ?? null,
+        },
+        config: prov?.config || {},
+      }
+    }
+  } catch {
+    // sin Redis no hay cerrojo
+  }
+  try {
+    return await registrarWebhookSinCerrojo(prov, previo)
+  } finally {
+    if (conCerrojo) redis.del(cerrojo).catch(() => {})
+  }
+}
+
+async function registrarWebhookSinCerrojo(prov, previo) {
+  let resultado
+  try {
+    if (prov?.type !== 'brevo') throw new Error('Solo los proveedores de Brevo usan webhook')
+    const url = urlWebhookBrevo(prov.id)
+    if (!/^https?:\/\//i.test(url)) throw new Error('APP_BASE_URL no está configurada: la app no conoce su URL pública')
+    const integracion = await cargarProveedor('brevo')
+    if (typeof integracion?.asegurarWebhook !== 'function') throw new Error('La integración de Brevo no está disponible')
+    const credenciales = descifrarCredenciales(prov.credentials_enc)
+    resultado = await integracion.asegurarWebhook(credenciales, url)
+  } catch (err) {
+    // nunca se registra el error con las credenciales dentro: solo el mensaje
+    resultado = { ok: false, creado: false, id: null, detalle: texto(err?.message) || 'No se pudo registrar el webhook' }
+  }
+  const ok = resultado?.ok === true
+  const detalle = texto(resultado?.detalle) || (ok ? 'Webhook registrado en Brevo' : 'No se pudo registrar el webhook')
+  const webhook = {
+    registrado: ok,
+    id: ok ? resultado.id ?? null : previo.id ?? null,
+    comprobado_en: new Date().toISOString(),
+    error: ok ? null : detalle.slice(0, 500),
+  }
+  // Se mezcla con `||` de jsonb para no pisar el resto de config. validarConfig solo deja pasar
+  // claves conocidas, así que este bloque no puede fabricarse desde el panel.
+  let config = { ...(prov?.config || {}), webhook }
+  try {
+    const { rows: [fila] } = await q(
+      `UPDATE providers
+          SET config = COALESCE(config, '{}'::jsonb) || jsonb_build_object('webhook', $1::jsonb), updated_at = now()
+        WHERE id = $2 RETURNING config`,
+      [JSON.stringify(webhook), prov.id]
+    )
+    if (fila?.config) config = fila.config
+  } catch {
+    // si no se puede persistir, el resultado se devuelve igualmente al panel
+  }
+  return { ok, creado: Boolean(resultado?.creado), detalle, webhook, config }
+}
+
+/** Trozo de respuesta de alta/edición con el resultado del registro del webhook (y el aviso si falló). */
+export function respuestaWebhook(r) {
+  if (!r) return {}
+  const webhook = { ok: r.ok, creado: r.creado, detalle: r.detalle, webhook: r.webhook }
+  return r.ok
+    ? { webhook }
+    : { webhook, aviso: `El proveedor se ha guardado, pero no se pudo registrar el webhook en Brevo: ${r.detalle}` }
+}
+
+/**
  * ¿El dominio de este correo lo tiene verificado OTRA subcuenta?
  *
  * El índice único parcial de sender_domains (SPEC §3) es el único guardarraíl duro entre clientes de
@@ -717,13 +805,20 @@ export default async function locationRoutes(app) {
     const limite = validarLimiteDiario(b.daily_limit)
     if (limite.error) return malo(reply, limite.error)
 
+    const credencialesEnc = cifrarCredenciales(b.credentials)
     const { rows: [p] } = await q(
       `INSERT INTO providers (owner_scope, location_id, name, type, credentials_enc, config, daily_limit)
        VALUES ('location',$1,$2,$3,$4,$5::jsonb,$6)
        RETURNING id, name, type, config, status, last_check_at, last_error, daily_limit, created_at, updated_at`,
-      [loc(req), nombre, tipo, cifrarCredenciales(b.credentials), JSON.stringify(cfg.valor), limite.valor]
+      [loc(req), nombre, tipo, credencialesEnc, JSON.stringify(cfg.valor), limite.valor]
     )
-    return reply.code(201).send({ proveedor: { ...p, asignado: false, credenciales: { configurado: true } } })
+    // Brevo: el webhook se registra solo. Si falla, el proveedor queda creado y se devuelve el aviso.
+    const webhook = tipo === 'brevo' ? await registrarWebhookProveedor({ ...p, credentials_enc: credencialesEnc }) : null
+    if (webhook) p.config = webhook.config
+    return reply.code(201).send({
+      proveedor: { ...p, asignado: false, credenciales: { configurado: true } },
+      ...respuestaWebhook(webhook),
+    })
   })
 
   app.patch('/api/loc/proveedores/:id', guard, async (req, reply) => {
@@ -742,6 +837,7 @@ export default async function locationRoutes(app) {
 
     const campos = []
     const params = []
+    let credencialesEnc = null
     const set = (sql, valor) => {
       params.push(valor)
       campos.push(`${sql} = $${params.length}`)
@@ -755,6 +851,8 @@ export default async function locationRoutes(app) {
     if (b.config !== undefined) {
       const cfg = validarConfig(actual.type, b.config)
       if (cfg.error) return malo(reply, cfg.error)
+      // el estado del webhook lo escribe la app, no el panel: se conserva al reemplazar la config
+      if (actual.config?.webhook) cfg.valor.webhook = actual.config.webhook
       params.push(JSON.stringify(cfg.valor))
       campos.push(`config = $${params.length}::jsonb`)
     }
@@ -767,7 +865,8 @@ export default async function locationRoutes(app) {
     if (b.credentials !== undefined && b.credentials !== null) {
       const errCred = validarCredenciales(actual.type, b.credentials)
       if (errCred) return malo(reply, errCred)
-      set('credentials_enc', cifrarCredenciales(b.credentials))
+      credencialesEnc = cifrarCredenciales(b.credentials)
+      set('credentials_enc', credencialesEnc)
       campos.push(`status = 'sin_probar'`, `last_error = NULL`, `last_check_at = NULL`)
     }
     if (!campos.length) return malo(reply, 'No hay nada que actualizar')
@@ -778,7 +877,13 @@ export default async function locationRoutes(app) {
        RETURNING id, name, type, config, status, last_check_at, last_error, daily_limit, created_at, updated_at`,
       params
     )
-    return { proveedor: { ...p, asignado: false, credenciales: { configurado: true } } }
+    // Brevo: con clave nueva (o si aún no constaba registrado) se vuelve a asegurar el webhook.
+    const webhook =
+      actual.type === 'brevo' && (credencialesEnc || actual.config?.webhook?.registrado !== true)
+        ? await registrarWebhookProveedor({ ...p, credentials_enc: credencialesEnc || actual.credentials_enc })
+        : null
+    if (webhook) p.config = webhook.config
+    return { proveedor: { ...p, asignado: false, credenciales: { configurado: true } }, ...respuestaWebhook(webhook) }
   })
 
   app.delete('/api/loc/proveedores/:id', guard, async (req, reply) => {
@@ -806,6 +911,28 @@ export default async function locationRoutes(app) {
     }
     await q('DELETE FROM providers WHERE id=$1', [id])
     return { ok: true }
+  })
+
+  // Vuelve a intentar el registro del webhook en Brevo (solo proveedores propios de tipo brevo).
+  app.post('/api/loc/proveedores/:id/webhook', guard, async (req, reply) => {
+    const id = idDe(req.params.id)
+    if (!id) return malo(reply, 'Identificador de proveedor no válido')
+    const locationId = loc(req)
+    const prov = await proveedorPropio(id, locationId)
+    if (!prov) {
+      const cedido = await proveedorUsable(id, locationId)
+      if (cedido) {
+        return reply.code(403).send({ error: 'Este proveedor lo gestiona la agencia: es ella quien registra su webhook' })
+      }
+      return reply.code(404).send({ error: 'Proveedor no encontrado' })
+    }
+    if (prov.type !== 'brevo') return malo(reply, 'Solo los proveedores de Brevo usan webhook')
+    // GET/POST /v3/webhooks comparten el cupo de 100 peticiones/hora de Brevo: se limita el botón
+    if (!(await limitar(`webhook:${locationId}`, 10, 60))) {
+      return reply.code(429).send({ error: 'Demasiados intentos seguidos. Espera un minuto.' })
+    }
+    const r = await registrarWebhookProveedor(prov)
+    return { ok: r.ok, creado: r.creado, detalle: r.detalle, webhook: r.webhook }
   })
 
   app.post('/api/loc/proveedores/:id/probar', guard, async (req, reply) => {

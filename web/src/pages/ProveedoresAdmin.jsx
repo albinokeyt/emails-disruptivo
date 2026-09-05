@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api } from '../api.js'
+import { api, registrarWebhookProveedorAdmin } from '../api.js'
+import { WebhookBrevo } from './Proveedores.jsx'
 import {
   Aviso,
   Badge,
@@ -74,6 +75,8 @@ export default function ProveedoresAdmin() {
   const [errores, setErrores] = useState([])
   const [guardando, setGuardando] = useState(false)
   const [aBorrar, setABorrar] = useState(null)
+  const [registrando, setRegistrando] = useState(null)
+  const [avisoWebhook, setAvisoWebhook] = useState(null) // {ok, detalle}
 
   const cargar = useCallback(async () => {
     try {
@@ -150,14 +153,31 @@ export default function ProveedoresAdmin() {
 
     setGuardando(true)
     try {
-      if (esNuevo) await api.post('/api/admin/proveedores', cuerpo)
-      else await api.patch(`/api/admin/proveedores/${modal.id}`, cuerpo)
+      const r = esNuevo
+        ? await api.post('/api/admin/proveedores', cuerpo)
+        : await api.patch(`/api/admin/proveedores/${modal.id}`, cuerpo)
+      // el proveedor se guarda aunque Brevo no acepte el webhook: el aviso se enseña aparte
+      setAvisoWebhook(r?.aviso ? { ok: false, detalle: r.aviso } : null)
       setModal(null)
       await cargar()
     } catch (err) {
       setErrores([err.message])
     } finally {
       setGuardando(false)
+    }
+  }
+
+  const registrarWebhook = async (p) => {
+    setRegistrando(p.id)
+    setAvisoWebhook(null)
+    try {
+      const d = await registrarWebhookProveedorAdmin(p.id)
+      setAvisoWebhook({ ok: d?.ok !== false, detalle: d?.detalle || 'Webhook registrado en Brevo.' })
+      await cargar()
+    } catch (err) {
+      setAvisoWebhook({ ok: false, detalle: err.message })
+    } finally {
+      setRegistrando(null)
     }
   }
 
@@ -193,6 +213,11 @@ export default function ProveedoresAdmin() {
       </div>
 
       {error && <Aviso variant="error">{error}</Aviso>}
+      {avisoWebhook && (
+        <Aviso variant={avisoWebhook.ok ? 'ok' : 'aviso'} onCerrar={() => setAvisoWebhook(null)}>
+          {avisoWebhook.detalle}
+        </Aviso>
+      )}
 
       <div className={TARJETA}>
         {datos.length === 0 ? (
@@ -206,7 +231,14 @@ export default function ProveedoresAdmin() {
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 font-medium">{p.name}</td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 text-ink2">{TIPOS[p.type] || p.type}</td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 text-ink2 text-xs">
-                  {p.type === 'smtp' ? `${p.config?.host || '—'}:${p.config?.port ?? '—'}` : 'Brevo (API)'}
+                  {p.type === 'smtp' ? (
+                    `${p.config?.host || '—'}:${p.config?.port ?? '—'}`
+                  ) : (
+                    <>
+                      Brevo (API)
+                      <WebhookBrevo proveedor={p} registrando={registrando === p.id} onRegistrar={() => registrarWebhook(p)} />
+                    </>
+                  )}
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60">
                   <Badge status={p.status} />

@@ -671,3 +671,80 @@ host:587` y `Verify return code: 0 (ok)`. El HTTP-01 propio queda documentado co
 despliegues sin Traefik/ACME delante; el DNS-01 con ficheros, para un host que no enrute a este
 servidor. **No se activa `SMTP_RELAY_ENABLED` en EasyPanel sin `SMTP_RELAY_TRAEFIK_ACME`** (o
 ficheros): con ACME propio el relay se quedaría con el autofirmado que GHL rechaza.
+
+
+---
+
+## 14. Buzón (correo entrante por IMAP)
+
+Sección nueva del panel de subcuenta, **Buzón**, tipo Gmail: la app trae por IMAP el correo de una o
+varias cuentas del cliente, lo guarda, lo muestra en hilos y permite responder desde ahí usando los
+remitentes/proveedores que ya existen. Con cuota de espacio por subcuenta para no saturar el VPS.
+
+### 14.1 Decisiones
+- **IMAP, no POP3**: mantiene el correo en el servidor y sincroniza estado. Al configurar se elige
+  «dejar copia en el servidor» (por defecto) o «borrar del servidor tras traerlo» (`delete_after_import`).
+- **Adjuntos en Postgres** (`inbox_attachments.content bytea`) para no depender de volúmenes; la cuota
+  lo hace sostenible. El mensaje crudo NO se guarda: solo cuerpo parseado + adjuntos + `size_bytes`.
+- **Responder** = encolar en `messages` con `origin='buzon'`, `In-Reply-To`/`References` en
+  `extra_headers`, `thread_key` e `inbox_reply_to_id`; sale por `mailboxes.reply_sender_id` (o el
+  remitente por defecto de la subcuenta). Sin configuración SMTP aparte. `render.js`/proveedores
+  deben propagar `extra_headers` como cabeceras del correo.
+- **Cuota**: `location_settings.buzon_quota_mb` (NULL = `settings.limites.buzon_quota_mb`, def. 200).
+  `buzon_used_bytes` es un contador cacheado (suma de `size_bytes` de mensajes + adjuntos) que se
+  actualiza al insertar/borrar. Si un mensaje no cabe, la sincronización se detiene, el buzón pasa a
+  `cuota_llena` y el panel lo avisa; al borrar correo vuelve a arrancar sola.
+- Dependencias nuevas: `imapflow` (cliente IMAP) y `sanitize-html` (sin scripts/formularios;
+  imágenes remotas bloqueadas hasta que el usuario pulse «cargar imágenes»).
+
+### 14.2 Sincronización — `src/lib/buzon-sync.js`
+Bucle en el worker (cada 60 s revisa buzones `enabled` cuyo `last_sync_at` sea más antiguo que su
+`sync_interval_min`). Por buzón: conectar (TLS según `secure`), abrir `folder`; si cambia
+`UIDVALIDITY` → `last_uid=0`; buscar `uid > last_uid`; para cada UID: descargar el mensaje crudo,
+`simpleParser`, calcular `size_bytes`, comprobar cuota, insertar mensaje + adjuntos (dedupe por
+`(mailbox_id, uid)` y por `message_id` dentro de la subcuenta), `thread_key` = primer id de
+`References` o el propio `Message-ID`, actualizar `last_uid`; si `delete_after_import` → marcar
+`\Deleted` + expunge. Errores → `status='error'` + `last_error` sin tumbar el worker. Lock por buzón
+en Redis para que dos instancias no sincronicen el mismo. Un botón «Sincronizar ahora» fuerza una
+pasada. Exporta `arrancarSyncBuzon(log)` / `pararSyncBuzon()` y `sincronizarBuzon(id, {log})`.
+
+### 14.3 Contrato HTTP (todas bajo `requireLocation`, `src/routes/buzon.js`)
+| Método | Ruta | Notas |
+|---|---|---|
+| GET/POST/PATCH/DELETE | `/api/loc/buzon/cuentas[/:id]` | CRUD de `mailboxes`; la contraseña nunca se devuelve (`configurado:true`) |
+| POST | `/api/loc/buzon/cuentas/:id/probar` | conecta y abre la carpeta → `{ok, detalle, mensajes_en_servidor}` |
+| POST | `/api/loc/buzon/cuentas/:id/sincronizar` | fuerza sincronización → `{ok, nuevos, detalle}` |
+| GET | `/api/loc/buzon/mensajes` | filtros `cuenta`, `q`, `no_leidos`, `desde`, `hasta`; paginado; cada fila: id, from, subject, date, snippet, size_bytes, has_attachments, is_read, thread_key, respuestas (nº de envíos nuestros en el hilo) |
+| GET | `/api/loc/buzon/mensajes/:id` | mensaje completo + adjuntos (metadatos) + hilo: recibidos y enviados (`messages` con el mismo `thread_key`) ordenados por fecha; marca `is_read=true` |
+| PATCH | `/api/loc/buzon/mensajes/:id` | `{is_read}` |
+| DELETE | `/api/loc/buzon/mensajes/:id?servidor=1` | borra en la app (y adjuntos, descontando cuota); con `servidor=1` también en IMAP si el UID sigue existiendo |
+| GET | `/api/loc/buzon/adjuntos/:id` | descarga con `Content-Disposition`; comprueba que el mensaje es de la subcuenta |
+| POST | `/api/loc/buzon/mensajes/:id/responder` | `{html, text, sender_id?, todos:boolean, cc, bcc}` → encola con cabeceras de hilo, asunto `Re: …`, cita del original al final |
+| POST | `/api/loc/buzon/mensajes/:id/reenviar` | `{to, html, text, sender_id?}` → asunto `Fwd: …` (sin adjuntos en v1: se avisa en la UI) |
+| GET | `/api/loc/buzon/espacio` | `{usado_bytes, cuota_mb, porcentaje, por_cuenta:[…]}` |
+
+Admin (`requireAdmin`, en `src/routes/admin.js`): `GET /api/admin/buzon/espacio` (uso y cuota de todas
+las subcuentas), `PATCH /api/admin/subcuentas/:locationId/buzon` `{quota_mb|null}`, y el valor por
+defecto `buzon_quota_mb` dentro de `PUT /api/admin/ajustes` (`limites`).
+
+### 14.4 Pantallas
+- `Buzon.jsx` (ruta `/buzon`, entrada de menú «Buzón» con contador de no leídos): tres columnas —
+  cuentas/carpetas (Bandeja, No leídos, Enviados desde el buzón) · lista (remitente, asunto, snippet,
+  fecha, **tamaño**, clip si hay adjuntos, negrita si no leído; búsqueda y paginación) · detalle con
+  el hilo (recibidos y nuestras respuestas con su estado de entrega), HTML en `<iframe sandbox>` con
+  imágenes bloqueadas por defecto, adjuntos descargables, botones Responder / Responder a todos /
+  Reenviar / Borrar (con opción «también del servidor»). Barra superior de espacio «X MB de Y MB».
+- **Engranaje** ⚙ en la cabecera de Buzón: modal con la lista de cuentas y el formulario
+  (nombre, correo, servidor IMAP, puerto, TLS, usuario, contraseña, carpeta, «Qué hacer tras traer el
+  correo: dejar copia / borrar del servidor», cada cuántos minutos, remitente para responder),
+  botones Probar conexión y Sincronizar ahora, estado y último error. Ayuda corta: Gmail y Outlook
+  exigen «contraseña de aplicación» con verificación en dos pasos.
+- Admin: en `Subcuentas.jsx` columna «Buzón: usado / cuota» con edición de la cuota; en `Ajustes.jsx`
+  el valor por defecto.
+
+### 14.5 Seguridad y límites
+Credenciales IMAP cifradas como las de proveedores; nunca en logs. Tamaño máximo por mensaje
+`BUZON_MAX_MENSAJE_MB` (def. 25): los que lo superen se guardan sin adjuntos y con aviso. Los
+adjuntos se sirven con `Content-Type` real pero `X-Content-Type-Options: nosniff` y como descarga.
+El HTML se sanea en servidor antes de guardarlo. Las respuestas pasan por la lista de supresión y los
+límites de envío como cualquier otro correo.

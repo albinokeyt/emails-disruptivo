@@ -24,6 +24,8 @@ import {
   filtrosEnvios,
   idDe,
   paginar,
+  registrarWebhookProveedor,
+  respuestaWebhook,
   serializarRelay,
   texto,
   urlWebhookDe,
@@ -176,13 +178,20 @@ export default async function adminRoutes(app) {
     const limite = validarLimiteDiario(b.daily_limit)
     if (limite.error) return malo(reply, limite.error)
 
+    const credencialesEnc = cifrarCredenciales(b.credentials)
     const { rows: [p] } = await q(
       `INSERT INTO providers (owner_scope, location_id, name, type, credentials_enc, config, daily_limit)
        VALUES ('admin', NULL, $1,$2,$3,$4::jsonb,$5)
        RETURNING id, name, type, config, status, last_check_at, last_error, daily_limit, created_at, updated_at`,
-      [nombre, tipo, cifrarCredenciales(b.credentials), JSON.stringify(cfg.valor), limite.valor]
+      [nombre, tipo, credencialesEnc, JSON.stringify(cfg.valor), limite.valor]
     )
-    return reply.code(201).send({ proveedor: { ...p, asignaciones: 0, credenciales: { configurado: true } } })
+    // Brevo: el webhook se registra solo. Si falla, el proveedor queda creado y se devuelve el aviso.
+    const webhook = tipo === 'brevo' ? await registrarWebhookProveedor({ ...p, credentials_enc: credencialesEnc }) : null
+    if (webhook) p.config = webhook.config
+    return reply.code(201).send({
+      proveedor: { ...p, asignaciones: 0, credenciales: { configurado: true } },
+      ...respuestaWebhook(webhook),
+    })
   })
 
   const proveedorAdmin = async (id) => {
@@ -202,6 +211,7 @@ export default async function adminRoutes(app) {
 
     const campos = []
     const params = []
+    let credencialesEnc = null
     const set = (columna, valor) => {
       params.push(valor)
       campos.push(`${columna} = $${params.length}`)
@@ -215,6 +225,8 @@ export default async function adminRoutes(app) {
     if (b.config !== undefined) {
       const cfg = validarConfig(actual.type, b.config)
       if (cfg.error) return malo(reply, cfg.error)
+      // el estado del webhook lo escribe la app, no el panel: se conserva al reemplazar la config
+      if (actual.config?.webhook) cfg.valor.webhook = actual.config.webhook
       params.push(JSON.stringify(cfg.valor))
       campos.push(`config = $${params.length}::jsonb`)
     }
@@ -226,7 +238,8 @@ export default async function adminRoutes(app) {
     if (b.credentials !== undefined && b.credentials !== null) {
       const errCred = validarCredenciales(actual.type, b.credentials)
       if (errCred) return malo(reply, errCred)
-      set('credentials_enc', cifrarCredenciales(b.credentials))
+      credencialesEnc = cifrarCredenciales(b.credentials)
+      set('credentials_enc', credencialesEnc)
       campos.push(`status = 'sin_probar'`, `last_error = NULL`, `last_check_at = NULL`)
     }
     if (!campos.length) return malo(reply, 'No hay nada que actualizar')
@@ -238,7 +251,13 @@ export default async function adminRoutes(app) {
        RETURNING id, name, type, config, status, last_check_at, last_error, daily_limit, created_at, updated_at`,
       params
     )
-    return { proveedor: { ...p, credenciales: { configurado: true } } }
+    // Brevo: con clave nueva (o si aún no constaba registrado) se vuelve a asegurar el webhook.
+    const webhook =
+      actual.type === 'brevo' && (credencialesEnc || actual.config?.webhook?.registrado !== true)
+        ? await registrarWebhookProveedor({ ...p, credentials_enc: credencialesEnc || actual.credentials_enc })
+        : null
+    if (webhook) p.config = webhook.config
+    return { proveedor: { ...p, credenciales: { configurado: true } }, ...respuestaWebhook(webhook) }
   })
 
   app.delete('/api/admin/proveedores/:id', guard, async (req, reply) => {
@@ -265,6 +284,17 @@ export default async function adminRoutes(app) {
     }
     await q(`DELETE FROM providers WHERE id=$1 AND owner_scope='admin'`, [id])
     return { ok: true }
+  })
+
+  // Vuelve a intentar el registro del webhook en Brevo de un proveedor de la agencia.
+  app.post('/api/admin/proveedores/:id/webhook', guard, async (req, reply) => {
+    const id = idDe(req.params.id)
+    if (!id) return malo(reply, 'Identificador de proveedor no válido')
+    const prov = await proveedorAdmin(id)
+    if (!prov) return reply.code(404).send({ error: 'Proveedor no encontrado' })
+    if (prov.type !== 'brevo') return malo(reply, 'Solo los proveedores de Brevo usan webhook')
+    const r = await registrarWebhookProveedor(prov)
+    return { ok: r.ok, creado: r.creado, detalle: r.detalle, webhook: r.webhook }
   })
 
   app.post('/api/admin/proveedores/:id/probar', guard, async (req, reply) => {
