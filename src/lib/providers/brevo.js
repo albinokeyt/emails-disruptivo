@@ -9,6 +9,8 @@
 //
 // La clave de API no aparece NUNCA en un mensaje de error ni en un log.
 
+import { cabecerasExtra } from '../render.js'
+
 const API = 'https://api.brevo.com/v3'
 const TIEMPO_ENVIO_MS = 30_000
 const TIEMPO_CONSULTA_MS = 15_000
@@ -48,6 +50,7 @@ function errorProveedor(mensaje, opciones = {}) {
   err.permanente = Boolean(opciones.permanente)
   err.proveedor = 'brevo'
   if (opciones.codigo != null) err.codigo = opciones.codigo
+  if (opciones.codigoBrevo) err.codigoBrevo = opciones.codigoBrevo
   if (opciones.credenciales) err.credenciales = true
   if (opciones.esperarMs) err.esperarMs = opciones.esperarMs
   return err
@@ -77,11 +80,15 @@ function direccionesBrevo(valores) {
 }
 
 // Brevo espera las cabeceras personalizadas en Title-Case-Format y no admite saltos de línea.
+// References acumula un <id> por cada vuelta del hilo (SPEC §14): tiene más margen que el resto.
+const MAX_VALOR_CABECERA = 900
+const MAX_VALOR_REFERENCES = 4000
+
 function cabecerasBrevo(cabeceras) {
   const salida = {}
   for (const [clave, valor] of Object.entries(cabeceras || {})) {
     const nombre = limpiar(clave, 100).replace(/[^A-Za-z0-9-]/g, '')
-    const contenido = limpiar(valor, 900)
+    const contenido = limpiar(valor, /^references$/i.test(nombre) ? MAX_VALOR_REFERENCES : MAX_VALOR_CABECERA)
     if (nombre && contenido) salida[nombre] = contenido
   }
   return salida
@@ -119,7 +126,7 @@ function errorDeRespuesta(respuesta, datos, cuerpoTexto) {
   // arreglarlo en Brevo, no reintentarlo (cada reintento gastaría cuota para el mismo rechazo).
   return errorProveedor(
     `Brevo rechazó la petición (${estado}${codigoBrevo ? `, ${codigoBrevo}` : ''})${sufijo}`,
-    { permanente: true, codigo: estado }
+    { permanente: true, codigo: estado, codigoBrevo }
   )
 }
 
@@ -202,8 +209,11 @@ export async function asegurarWebhook(credenciales = {}, url) {
       const { datos } = await peticion('/webhooks?type=transactional', { apiKey, timeoutMs: TIEMPO_WEBHOOK_MS })
       lista = Array.isArray(datos?.webhooks) ? datos.webhooks : []
     } catch (err) {
-      // sin ningún webhook dado de alta Brevo puede responder 404: se trata como lista vacía
-      if (err?.codigo !== 404) throw err
+      // Sin ningún webhook dado de alta, Brevo NO devuelve una lista vacía: responde 404 o incluso
+      // 400 con code=document_not_found («Webhook record does not exist»). Ambos = lista vacía.
+      const sinWebhooks = err?.codigo === 404 || err?.codigoBrevo === 'document_not_found' ||
+        /does not exist/i.test(texto(err?.message))
+      if (!sinWebhooks) throw err
     }
 
     const existente = lista.find((w) => texto(w?.url) === destino)
@@ -310,7 +320,10 @@ export default {
       throw errorProveedor(`Brevo admite como mucho ${MAX_DESTINATARIOS} destinatarios por mensaje`, { permanente: true })
     }
 
-    const cabeceras = cabecerasBrevo(ctx.cabeceras)
+    // Cabeceras de hilo de una respuesta del buzón (In-Reply-To/References, SPEC §14): render.js
+    // ya las funde en ctx.cabeceras; si alguien llama a enviar() directamente puede pasarlas en
+    // ctx.extraHeaders. Van con menos prioridad: las de la app nunca quedan pisadas.
+    const cabeceras = cabecerasBrevo({ ...cabecerasExtra(ctx.extraHeaders ?? ctx.extra_headers), ...(ctx.cabeceras || {}) })
     const correlationId = limpiar(ctx.correlationId, 200)
     // Clave de correlación: vuelve tal cual en TODOS los webhooks de Brevo.
     if (correlationId) cabeceras['X-Mailin-custom'] = correlationId

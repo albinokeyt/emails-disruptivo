@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api } from '../api.js'
+import { adminCuotaBuzon, adminEspacioBuzon, api, fmtBytes } from '../api.js'
 import { Aviso, Badge, Boton, Campo, Copiar, Modal, Spinner, Tabla } from '../components/ui.jsx'
 
 const TARJETA = 'bg-card border border-border rounded-2xl p-5'
@@ -10,6 +10,73 @@ const lista = (d, clave) => (Array.isArray(d) ? d : Array.isArray(d?.[clave]) ? 
 const fecha = (d) => (d ? new Date(d).toLocaleDateString('es-ES', { day: '2-digit', month: 'short', year: 'numeric' }) : '—')
 
 const numero = (n) => new Intl.NumberFormat('es-ES').format(Number(n) || 0)
+
+const numeroONull = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v))
+
+// GET /api/admin/buzon/espacio (SPEC §14.3): { por_defecto_mb, subcuentas:[{ location_id,
+// usado_bytes, quota_mb (propia o null), cuota_efectiva_mb, porcentaje, cuentas, cuentas_llenas }] }.
+// Se indexa por location_id; `quota_mb` a null significa que la subcuenta usa la de Ajustes.
+function indexarEspacio(d) {
+  const filas = Array.isArray(d) ? d : Object.values(d || {}).find(Array.isArray) || []
+  const mapa = new Map()
+  for (const r of filas) {
+    if (!r?.location_id) continue
+    const usado = numeroONull(r.usado_bytes ?? r.buzon_used_bytes) || 0
+    const cuota = numeroONull(r.cuota_efectiva_mb ?? r.cuota_mb ?? r.buzon_quota_mb ?? r.quota_mb)
+    const propia = r.quota_mb !== undefined ? r.quota_mb !== null : r.buzon_quota_mb !== undefined ? r.buzon_quota_mb !== null : null
+    const pct = numeroONull(r.porcentaje) ?? (cuota ? (usado / (cuota * 1024 * 1024)) * 100 : 0)
+    mapa.set(r.location_id, {
+      usado,
+      cuota,
+      propia,
+      pct: Math.max(0, pct),
+      cuentas: numeroONull(r.cuentas),
+      llenas: numeroONull(r.cuentas_llenas) || 0,
+    })
+  }
+  return mapa
+}
+
+const colorCuota = (pct) => (pct >= 90 ? 'bg-bad' : pct >= 70 ? 'bg-warn' : 'bg-gold')
+
+function CeldaBuzon({ s, uso, onEditar }) {
+  // si el listado de subcuentas ya trae las columnas de la migración 005, valen como respaldo
+  const datos =
+    uso ||
+    (s.buzon_used_bytes !== undefined || s.buzon_quota_mb !== undefined
+      ? {
+          usado: numeroONull(s.buzon_used_bytes) || 0,
+          cuota: numeroONull(s.buzon_quota_mb),
+          propia: s.buzon_quota_mb != null,
+          pct: numeroONull(s.buzon_quota_mb) ? ((numeroONull(s.buzon_used_bytes) || 0) / (numeroONull(s.buzon_quota_mb) * 1024 * 1024)) * 100 : 0,
+        }
+      : null)
+  if (!datos) return <span className="text-xs text-mut">—</span>
+  const lleno = datos.llenas > 0 || datos.pct >= 100
+  return (
+    <div className="min-w-44">
+      <div className="flex items-center gap-2 text-xs whitespace-nowrap">
+        <span className={`tabular-nums ${lleno ? 'text-bad' : 'text-ink2'}`} title={lleno ? 'Buzón lleno: su sincronización está parada' : undefined}>
+          {fmtBytes(datos.usado)}
+          {datos.cuota ? ` / ${datos.cuota} MB` : ''}
+        </span>
+        {lleno ? (
+          <span className="text-[10px] text-bad">lleno</span>
+        ) : (
+          datos.propia === false && <span className="text-[10px] text-mut">(por defecto)</span>
+        )}
+        <button type="button" className="ml-auto text-[11px] text-gold hover:underline" onClick={onEditar}>
+          Cuota
+        </button>
+      </div>
+      {datos.cuota ? (
+        <div className="h-1 rounded-full bg-border overflow-hidden mt-1" title={`${Math.round(datos.pct)} % de la cuota`}>
+          <div className={`h-full rounded-full ${colorCuota(datos.pct)}`} style={{ width: `${Math.min(100, datos.pct)}%` }} />
+        </div>
+      ) : null}
+    </div>
+  )
+}
 
 const Dato = ({ etiqueta, valor }) => (
   <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5">
@@ -29,6 +96,10 @@ export default function Subcuentas() {
   const [busqueda, setBusqueda] = useState('')
   const [relay, setRelay] = useState(null) // {subcuenta, datos, password}
   const [activando, setActivando] = useState(null)
+  const [espacio, setEspacio] = useState(null) // Map location_id → { usado, cuota, propia, pct }
+  const [cuota, setCuota] = useState(null) // { subcuenta, valor }
+  const [guardandoCuota, setGuardandoCuota] = useState(false)
+  const [errorCuota, setErrorCuota] = useState('')
 
   const cargar = useCallback(async () => {
     try {
@@ -41,9 +112,44 @@ export default function Subcuentas() {
     }
   }, [])
 
+  // el espacio del buzón va aparte: si el endpoint no está, la columna solo enseña «—»
+  const cargarEspacio = useCallback(async () => {
+    try {
+      setEspacio(indexarEspacio(await adminEspacioBuzon()))
+    } catch {
+      setEspacio(new Map())
+    }
+  }, [])
+
   useEffect(() => {
     cargar()
-  }, [cargar])
+    cargarEspacio()
+  }, [cargar, cargarEspacio])
+
+  const abrirCuota = (s) => {
+    const uso = espacio?.get(s.location_id)
+    setErrorCuota('')
+    setCuota({ subcuenta: s, valor: uso?.propia && uso.cuota ? String(uso.cuota) : '' })
+  }
+
+  const guardarCuota = async (e) => {
+    e.preventDefault()
+    const v = cuota.valor.trim()
+    if (v && (!/^\d+$/.test(v) || Number(v) < 1)) {
+      setErrorCuota('La cuota tiene que ser un número entero de MB mayor que cero, o vacía para usar la de por defecto.')
+      return
+    }
+    setGuardandoCuota(true)
+    try {
+      await adminCuotaBuzon(cuota.subcuenta.location_id, v ? Number(v) : null)
+      setCuota(null)
+      await cargarEspacio()
+    } catch (err) {
+      setErrorCuota(err.message)
+    } finally {
+      setGuardandoCuota(false)
+    }
+  }
 
   const activarRelay = async (s) => {
     setActivando(s.location_id)
@@ -106,7 +212,7 @@ export default function Subcuentas() {
         ) : filtradas.length === 0 ? (
           <p className="text-sm text-mut py-10 text-center">Ninguna subcuenta coincide con la búsqueda.</p>
         ) : (
-          <Tabla columnas={['Subcuenta', 'Estado', 'Proveedores', 'Remitentes', 'Envíos', 'Instalada', '']}>
+          <Tabla columnas={['Subcuenta', 'Estado', 'Proveedores', 'Remitentes', 'Envíos', 'Buzón', 'Instalada', '']}>
             {filtradas.map((s) => (
               <tr key={s.location_id}>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60">
@@ -124,6 +230,9 @@ export default function Subcuentas() {
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 text-right tabular-nums text-ink2">
                   {numero(s.envios)}
+                </td>
+                <td className="px-3 py-2.5 text-sm border-t border-border/60">
+                  <CeldaBuzon s={s} uso={espacio?.get(s.location_id) || null} onEditar={() => abrirCuota(s)} />
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 text-ink2 whitespace-nowrap">
                   {fecha(s.created_at)}
@@ -166,8 +275,53 @@ export default function Subcuentas() {
             .
           </li>
           <li>Activarles el relay SMTP y entregarles tú mismo las credenciales.</li>
+          <li>
+            Ajustar la cuota del buzón de cada una (columna «Buzón»). El valor por defecto para todas se cambia en{' '}
+            <Link to="/admin/ajustes" className="text-gold hover:underline">
+              Ajustes
+            </Link>
+            .
+          </li>
         </ul>
       </div>
+
+      {cuota && (
+        <Modal
+          title={`Cuota del buzón · ${cuota.subcuenta.name || cuota.subcuenta.location_id}`}
+          description="Espacio máximo para el correo entrante (mensajes y adjuntos) de esta subcuenta."
+          onClose={() => setCuota(null)}
+        >
+          <form onSubmit={guardarCuota} className="space-y-4">
+            {errorCuota && <Aviso variant="error">{errorCuota}</Aviso>}
+            {espacio?.get(cuota.subcuenta.location_id) && (
+              <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5 text-sm text-ink2">
+                Ahora mismo ocupa <strong className="text-ink">{fmtBytes(espacio.get(cuota.subcuenta.location_id).usado)}</strong>
+                {espacio.get(cuota.subcuenta.location_id).cuota
+                  ? ` de ${espacio.get(cuota.subcuenta.location_id).cuota} MB (${Math.round(espacio.get(cuota.subcuenta.location_id).pct)} %)`
+                  : ''}
+                .
+              </div>
+            )}
+            <Campo
+              label="Cuota (MB)"
+              inputMode="numeric"
+              placeholder="Vacío = la de por defecto"
+              value={cuota.valor}
+              onChange={(e) => setCuota((c) => ({ ...c, valor: e.target.value }))}
+              autoFocus
+              hint="Si el buzón supera la cuota, su sincronización se para hasta que la subcuenta borre correo o subas el límite."
+            />
+            <div className="flex justify-end gap-2 pt-1">
+              <Boton type="button" variant="ghost" onClick={() => setCuota(null)} disabled={guardandoCuota}>
+                Cancelar
+              </Boton>
+              <Boton type="submit" cargando={guardandoCuota}>
+                Guardar cuota
+              </Boton>
+            </div>
+          </form>
+        </Modal>
+      )}
 
       {relay && (
         <Modal title={`Relay de ${relay.subcuenta.name || relay.subcuenta.location_id}`} onClose={() => setRelay(null)}>

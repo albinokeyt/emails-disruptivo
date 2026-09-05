@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import nodemailer from 'nodemailer'
+import { cabecerasExtra } from '../render.js'
 import { construirDireccionVerp } from '../verp.js'
 
 // Integración con cualquier SMTP genérico (SPEC §7), vía nodemailer.
@@ -60,11 +61,15 @@ function direcciones(valores) {
   return salida
 }
 
+// References acumula un <id> por cada vuelta del hilo (SPEC §14): tiene más margen que el resto.
+const MAX_VALOR_CABECERA = 900
+const MAX_VALOR_REFERENCES = 4000
+
 function cabecerasSmtp(cabeceras) {
   const salida = {}
   for (const [clave, valor] of Object.entries(cabeceras || {})) {
     const nombre = limpiar(clave, 100).replace(/[^A-Za-z0-9-]/g, '')
-    const contenido = limpiar(valor, 900)
+    const contenido = limpiar(valor, /^references$/i.test(nombre) ? MAX_VALOR_REFERENCES : MAX_VALOR_CABECERA)
     if (nombre && contenido) salida[nombre] = contenido
   }
   return salida
@@ -277,7 +282,10 @@ export default {
     if (!asunto) throw errorProveedor('El mensaje no tiene asunto', { permanente: true })
     if (!ctx.html && !ctx.texto) throw errorProveedor('El mensaje no tiene contenido', { permanente: true })
 
-    const cabeceras = cabecerasSmtp(ctx.cabeceras)
+    // Cabeceras de hilo de una respuesta del buzón (In-Reply-To/References, SPEC §14): render.js
+    // ya las funde en ctx.cabeceras; si alguien llama a enviar() directamente puede pasarlas en
+    // ctx.extraHeaders. Van con menos prioridad: las de la app nunca quedan pisadas.
+    const cabeceras = cabecerasSmtp({ ...cabecerasExtra(ctx.extraHeaders ?? ctx.extra_headers), ...(ctx.cabeceras || {}) })
     const correlationId = limpiar(ctx.correlationId, 200)
     // Con SMTP no hay webhooks: la correlación se guarda en una cabecera propia para poder cruzar
     // con los logs del proveedor o con un rebote que llegue después.

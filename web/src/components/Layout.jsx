@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
-  AtSign, Building2, FileText, Globe, LayoutDashboard, LogOut, Mail, MailX, Menu,
+  AtSign, Building2, FileText, Globe, Inbox, LayoutDashboard, LogOut, Mail, MailX, Menu,
   Send, Server, Settings, Share2, ShieldCheck, Users, X,
 } from 'lucide-react'
+import { contarNoLeidosBuzon } from '../api.js'
 
 // La navegación es distinta según quién mira: la subcuenta gestiona lo suyo,
 // la agencia gestiona el parque entero.
@@ -13,10 +14,45 @@ const NAV_SUBCUENTA = [
   { to: '/remitentes', icono: AtSign, etiqueta: 'Remitentes' },
   { to: '/plantillas', icono: FileText, etiqueta: 'Plantillas' },
   { to: '/envios', icono: Send, etiqueta: 'Envíos' },
+  { to: '/buzon', icono: Inbox, etiqueta: 'Buzón', contador: 'buzon' },
   { to: '/rebotados', icono: MailX, etiqueta: 'Rebotados' },
   { to: '/relay', icono: Mail, etiqueta: 'Relay SMTP' },
   { to: '/dominios', icono: Globe, etiqueta: 'Dominios' },
 ]
+
+// Contador de no leídos del Buzón (SPEC §14.4). Se pide al entrar y cada minuto; la pantalla
+// Buzón emite `buzon:cambio` (con `no_leidos` en el detalle si ya lo sabe) al leer, borrar o
+// sincronizar para que el número se actualice al momento. Si el endpoint no responde (buzón sin
+// configurar, backend sin la sección 14) simplemente no se pinta nada.
+function useNoLeidosBuzon(activo) {
+  const [n, setN] = useState(0)
+  useEffect(() => {
+    if (!activo) return undefined
+    let vivo = true
+    const consultar = async () => {
+      try {
+        const total = await contarNoLeidosBuzon()
+        if (vivo) setN(total)
+      } catch {
+        if (vivo) setN(0)
+      }
+    }
+    const alCambiar = (e) => {
+      const dado = Number(e.detail?.no_leidos)
+      if (Number.isFinite(dado) && dado >= 0) setN(dado)
+      else consultar()
+    }
+    consultar()
+    const temporizador = setInterval(consultar, 60_000)
+    window.addEventListener('buzon:cambio', alCambiar)
+    return () => {
+      vivo = false
+      clearInterval(temporizador)
+      window.removeEventListener('buzon:cambio', alCambiar)
+    }
+  }, [activo])
+  return n
+}
 
 const NAV_ADMIN = [
   { to: '/admin', icono: Building2, etiqueta: 'Subcuentas', exacto: true },
@@ -47,25 +83,36 @@ function Marca({ ambito }) {
   )
 }
 
-function Enlaces({ items, onNavegar }) {
+function Enlaces({ items, contadores = {}, onNavegar }) {
   return (
     <nav className="flex-1 px-3 space-y-1 overflow-y-auto">
-      {items.map(({ to, icono: Icono, etiqueta, exacto }) => (
-        <NavLink
-          key={to}
-          to={to}
-          end={exacto}
-          onClick={onNavegar}
-          className={({ isActive }) =>
-            `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-colors ${
-              isActive ? 'bg-gold/10 text-gold' : 'text-ink2 hover:bg-card2 hover:text-ink'
-            }`
-          }
-        >
-          <Icono size={16} />
-          {etiqueta}
-        </NavLink>
-      ))}
+      {items.map(({ to, icono: Icono, etiqueta, exacto, contador }) => {
+        const n = contador ? Number(contadores[contador]) || 0 : 0
+        return (
+          <NavLink
+            key={to}
+            to={to}
+            end={exacto}
+            onClick={onNavegar}
+            className={({ isActive }) =>
+              `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-colors ${
+                isActive ? 'bg-gold/10 text-gold' : 'text-ink2 hover:bg-card2 hover:text-ink'
+              }`
+            }
+          >
+            <Icono size={16} />
+            {etiqueta}
+            {n > 0 && (
+              <span
+                className="ml-auto min-w-5 px-1.5 py-0.5 rounded-full bg-gold text-bg text-[10px] font-semibold text-center tabular-nums"
+                title={`${n} sin leer`}
+              >
+                {n > 99 ? '99+' : n}
+              </span>
+            )}
+          </NavLink>
+        )
+      })}
     </nav>
   )
 }
@@ -119,6 +166,7 @@ export default function Layout({ ambito = 'location', sesion = null, onSalir, ch
   const items = esAdmin ? NAV_ADMIN : NAV_SUBCUENTA
   const ubicacion = useLocation()
   const [abierto, setAbierto] = useState(false)
+  const noLeidos = useNoLeidosBuzon(!esAdmin)
 
   // el menú lateral se cierra solo al cambiar de pantalla en móvil
   useEffect(() => { setAbierto(false) }, [ubicacion.pathname])
@@ -153,7 +201,7 @@ export default function Layout({ ambito = 'location', sesion = null, onSalir, ch
             </button>
           </div>
 
-          <Enlaces items={items} onNavegar={() => setAbierto(false)} />
+          <Enlaces items={items} contadores={{ buzon: noLeidos }} onNavegar={() => setAbierto(false)} />
 
           {esAdmin ? <PieAdmin sesion={sesion} onSalir={onSalir} /> : <PieSubcuenta sesion={sesion} />}
         </aside>

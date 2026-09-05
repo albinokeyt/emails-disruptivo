@@ -14,10 +14,12 @@ import { asegurarActionSecret } from './lib/settings.js'
 import { rutasBaja } from './lib/tracking.js'
 import { asegurarCertificado, detenerRenovacion, motivoSinCertificado, programarRenovacion } from './lib/acme.js'
 import { detenerVigilanciaTraefik, vigilarCertificadoTraefik } from './lib/traefik.js'
+import { arrancarSyncBuzon, pararSyncBuzon } from './lib/buzon-sync.js'
 
 import acmeRoutes from './routes/acme.js'
 import oauthRoutes from './routes/oauth.js'
 import locationRoutes from './routes/location.js'
+import buzonRoutes from './routes/buzon.js'
 import adminRoutes from './routes/admin.js'
 import accionesRoutes from './routes/actions.js'
 import webhooksRoutes from './routes/webhooks.js'
@@ -83,6 +85,8 @@ app.get('/healthz', async (req, reply) => {
 // ---------------------------------------------------------------------------
 await app.register(oauthRoutes)
 await app.register(locationRoutes)
+// Buzón IMAP (SPEC §14.3): mismo prefijo /api/loc/* y mismo guarda requireLocation que el panel
+await app.register(buzonRoutes)
 await app.register(adminRoutes)
 await app.register(accionesRoutes)
 await app.register(webhooksRoutes)
@@ -229,6 +233,19 @@ const arrancarRelay = () =>
     inicio: ['iniciarRelay', 'arrancarRelay', 'startRelay', 'iniciarPasarela', 'arrancarPasarela', 'iniciar', 'arrancar', 'start'],
     parada: ['pararRelay', 'detenerRelay', 'stopRelay', 'pararPasarela', 'detenerPasarela', 'parar', 'detener', 'stop', 'cerrar'],
   })
+
+// Sincronización del buzón IMAP (SPEC §14.2). Vive junto al worker: solo la instancia que envía
+// correo trae correo, así una réplica «solo API» (WORKER_HABILITADO=false) no abre conexiones IMAP.
+// Que no arranque NO tumba la API: el panel sigue sirviendo lo ya guardado.
+function arrancarBuzon() {
+  try {
+    arrancarSyncBuzon(app.log)
+    paradas.push({ etiqueta: 'sincronización del buzón', parar: () => pararSyncBuzon() })
+    app.log.info('sincronización del buzón: en marcha (lib/buzon-sync.js)')
+  } catch (err) {
+    app.log.error({ err }, 'sincronización del buzón: no se pudo arrancar')
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 7b. Certificado TLS automático del relay (SPEC §13.1).
@@ -397,7 +414,10 @@ try {
 
   await app.listen({ port: config.port, host: '0.0.0.0' })
 
-  if (config.worker.habilitado) await arrancarWorker()
+  if (config.worker.habilitado) {
+    await arrancarWorker()
+    arrancarBuzon()
+  }
   if (config.relay.habilitado) {
     const relay = await arrancarRelay()
     // resultado null = la pasarela no abrió ningún puerto (ocupado, sin permisos…): sin escuchas no

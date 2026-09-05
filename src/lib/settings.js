@@ -1,9 +1,10 @@
+import { config } from '../config.js'
 import { q } from '../db.js'
 import { randomSecret } from './crypto.js'
 
 // Tabla settings (clave/valor jsonb). Claves usadas por la app:
 //   ghl      → { client_id, client_secret, app_id, shared_secret, company_id, action_secret }
-//   limites  → { envio_minuto, envio_dia, ... }
+//   limites  → { envio_minuto, envio_dia, buzon_quota_mb, ... }
 //   admins   → { emails: [], company_ids: [] }
 //
 // Cache muy corta en memoria: estos valores se leen en casi cada petición (secreto de acción,
@@ -57,9 +58,15 @@ const entero = (v, def) => {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : def
 }
 
+// Cuota de espacio del buzón (SPEC §14.1) cuando la subcuenta no tiene una propia en
+// location_settings.buzon_quota_mb: la de config (BUZON_QUOTA_MB_DEFAULT) y, si no, 200 MB.
+const CUOTA_BUZON_DEFECTO_MB = 200
+const cuotaBuzonDeConfig = () =>
+  entero(config.buzon?.quotaMbDefault ?? process.env.BUZON_QUOTA_MB_DEFAULT, CUOTA_BUZON_DEFECTO_MB)
+
 /**
- * Límites de envío por subcuenta. Los de la tabla mandan sobre las variables de entorno,
- * y estas sobre los valores por defecto del SPEC (60/min, 5000/día).
+ * Límites por subcuenta. Los de la tabla mandan sobre las variables de entorno, y estas sobre
+ * los valores por defecto del SPEC (60/min, 5000/día, 200 MB de buzón).
  */
 export async function getLimites() {
   const guardados = (await getSetting('limites')) || {}
@@ -67,6 +74,7 @@ export async function getLimites() {
     ...guardados,
     envio_minuto: entero(guardados.envio_minuto, entero(process.env.ENVIO_LIMITE_MINUTO, 60)),
     envio_dia: entero(guardados.envio_dia, entero(process.env.ENVIO_LIMITE_DIA, 5000)),
+    buzon_quota_mb: entero(guardados.buzon_quota_mb, cuotaBuzonDeConfig()),
   }
 }
 

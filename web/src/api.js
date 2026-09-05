@@ -155,6 +155,45 @@ export const rotarRelay = () => api.post('/api/loc/relay/rotar')
 export const actualizarRelay = (datos) => api.patch('/api/loc/relay', datos)
 
 /* ============================================================
+   §14 Buzón — correo entrante por IMAP (/api/loc/buzon/*)
+   ============================================================ */
+
+// Cuentas IMAP. La contraseña nunca vuelve: llega como { configurado:true }. En PATCH solo se
+// manda `password` si el usuario ha escrito una nueva.
+export const listarCuentasBuzon = () => api.get('/api/loc/buzon/cuentas')
+export const crearCuentaBuzon = (datos) => api.post('/api/loc/buzon/cuentas', datos)
+export const actualizarCuentaBuzon = (id, datos) => api.patch(`/api/loc/buzon/cuentas/${id}`, datos)
+export const eliminarCuentaBuzon = (id) => api.del(`/api/loc/buzon/cuentas/${id}`)
+// → { ok, detalle, mensajes_en_servidor }
+export const probarCuentaBuzon = (id) => api.post(`/api/loc/buzon/cuentas/${id}/probar`)
+// → { ok, nuevos, detalle }
+export const sincronizarCuentaBuzon = (id) => api.post(`/api/loc/buzon/cuentas/${id}/sincronizar`)
+
+// filtros: { cuenta, q, no_leidos, desde, hasta, pagina, limite } → { mensajes, total, pagina, limite }
+export const listarMensajesBuzon = (filtros) => api.get(`/api/loc/buzon/mensajes${consulta(filtros)}`)
+// mensaje completo + adjuntos (metadatos) + hilo; el backend lo marca como leído al abrirlo
+export const obtenerMensajeBuzon = (id) => api.get(`/api/loc/buzon/mensajes/${id}`)
+export const marcarMensajeBuzon = (id, leido) => api.patch(`/api/loc/buzon/mensajes/${id}`, { is_read: Boolean(leido) })
+// `servidor` = borrarlo también en el IMAP si el UID sigue existiendo allí
+export const eliminarMensajeBuzon = (id, servidor = false) =>
+  api.del(`/api/loc/buzon/mensajes/${id}${servidor ? '?servidor=1' : ''}`)
+// descarga directa del navegador (Content-Disposition: attachment), no una llamada fetch
+export const urlAdjuntoBuzon = (id) => `/api/loc/buzon/adjuntos/${id}`
+// { html, text, sender_id?, todos, cc, bcc } → encola en `messages` con origin 'buzon'
+export const responderMensajeBuzon = (id, datos) => api.post(`/api/loc/buzon/mensajes/${id}/responder`, datos)
+// { to, html, text, sender_id? } — sin adjuntos en esta versión
+export const reenviarMensajeBuzon = (id, datos) => api.post(`/api/loc/buzon/mensajes/${id}/reenviar`, datos)
+// → { usado_bytes, cuota_mb, porcentaje, por_cuenta:[…] }
+export const obtenerEspacioBuzon = () => api.get('/api/loc/buzon/espacio')
+
+// Contador del menú lateral: pide una sola fila de no leídos y se queda con el `total`.
+export async function contarNoLeidosBuzon() {
+  const d = await listarMensajesBuzon({ no_leidos: 1, limite: 1 })
+  const n = Number(d?.total)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/* ============================================================
    §5.3 Panel de admin — /api/admin/*
    ============================================================ */
 
@@ -204,6 +243,12 @@ export const adminListarEnvios = (filtros) => api.get(`/api/admin/envios${consul
 export const adminActivarRelay = (locationId) =>
   api.post(`/api/admin/subcuentas/${encodeURIComponent(locationId)}/relay`)
 
+// Buzón (SPEC §14.3, admin): uso y cuota de todas las subcuentas, y cuota por subcuenta
+// (`quota_mb` null = volver al valor por defecto de Ajustes → límites → buzon_quota_mb).
+export const adminEspacioBuzon = () => api.get('/api/admin/buzon/espacio')
+export const adminCuotaBuzon = (locationId, quotaMb) =>
+  api.patch(`/api/admin/subcuentas/${encodeURIComponent(locationId)}/buzon`, { quota_mb: quotaMb })
+
 export const adminObtenerAjustes = () => api.get('/api/admin/ajustes')
 export const adminGuardarAjustes = (datos) => api.put('/api/admin/ajustes', datos)
 
@@ -230,6 +275,22 @@ export const fmtFechaHora = (v) =>
 
 export const fmtNumero = (v) =>
   v === null || v === undefined || v === '' ? '—' : new Intl.NumberFormat('es-ES').format(Number(v) || 0)
+
+// "1,4 MB" para tamaños de mensajes, adjuntos y cuota del buzón (base 1024, como el sistema).
+export function fmtBytes(bytes) {
+  const n = Number(bytes)
+  if (!Number.isFinite(n) || n < 0) return '—'
+  if (n < 1024) return `${Math.round(n)} B`
+  const unidades = ['KB', 'MB', 'GB', 'TB']
+  let valor = n / 1024
+  let i = 0
+  while (valor >= 1024 && i < unidades.length - 1) {
+    valor /= 1024
+    i += 1
+  }
+  const decimales = valor < 10 ? 1 : 0
+  return `${new Intl.NumberFormat('es-ES', { maximumFractionDigits: decimales }).format(valor)} ${unidades[i]}`
+}
 
 /* ============================================================
    Dominios de correo gratuito

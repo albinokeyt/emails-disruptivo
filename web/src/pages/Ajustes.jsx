@@ -312,8 +312,9 @@ export default function Ajustes() {
   const [ghl, setGhl] = useState({ client_id: '', app_id: '', company_id: '' })
   const [secretos, setSecretos] = useState({ client_secret: '', shared_secret: '' })
   const [reemplazar, setReemplazar] = useState({ client_secret: false, shared_secret: false })
-  // Los nombres son los del backend (lib/settings.js → getLimites): envio_minuto / envio_dia.
-  const [limites, setLimites] = useState({ envio_minuto: '', envio_dia: '' })
+  // Los nombres son los del backend (lib/settings.js → getLimites): envio_minuto / envio_dia, y la
+  // cuota por defecto del buzón (SPEC §14.1: buzon_quota_mb, 200 MB si no se indica).
+  const [limites, setLimites] = useState({ envio_minuto: '', envio_dia: '', buzon_quota_mb: '' })
 
   const cargar = useCallback(async () => {
     try {
@@ -327,6 +328,7 @@ export default function Ajustes() {
       setLimites({
         envio_minuto: d?.limites?.envio_minuto == null ? '' : String(d.limites.envio_minuto),
         envio_dia: d?.limites?.envio_dia == null ? '' : String(d.limites.envio_dia),
+        buzon_quota_mb: d?.limites?.buzon_quota_mb == null ? '' : String(d.limites.buzon_quota_mb),
       })
       setSecretos({ client_secret: '', shared_secret: '' })
       setReemplazar({
@@ -350,6 +352,7 @@ export default function Ajustes() {
     for (const [clave, etiqueta] of [
       ['envio_minuto', 'por minuto'],
       ['envio_dia', 'por día'],
+      ['buzon_quota_mb', 'de cuota del buzón'],
     ]) {
       const v = limites[clave]
       if (v && (!/^\d+$/.test(v) || Number(v) < 1)) fallos.push(`El límite ${etiqueta} tiene que ser un entero mayor que cero.`)
@@ -375,6 +378,7 @@ export default function Ajustes() {
     // mandar null devolvería un 400 en vez de dejar el valor por defecto del entorno
     if (limites.envio_minuto) cuerpo.limites.envio_minuto = Number(limites.envio_minuto)
     if (limites.envio_dia) cuerpo.limites.envio_dia = Number(limites.envio_dia)
+    if (limites.buzon_quota_mb) cuerpo.limites.buzon_quota_mb = Number(limites.buzon_quota_mb)
     // los secretos solo viajan si el usuario ha escrito uno nuevo
     if (secretos.client_secret.trim()) cuerpo.ghl.client_secret = secretos.client_secret.trim()
     if (secretos.shared_secret.trim()) cuerpo.ghl.shared_secret = secretos.shared_secret.trim()
@@ -528,6 +532,17 @@ export default function Ajustes() {
               placeholder="5000"
               value={limites.envio_dia}
               onChange={(e) => setLimites((l) => ({ ...l, envio_dia: e.target.value }))}
+            />
+          </div>
+          <div className="border-t border-border/70 pt-4">
+            <Campo
+              className="sm:w-1/2 sm:pr-1.5"
+              label="Cuota de buzón por defecto (MB)"
+              inputMode="numeric"
+              placeholder="200"
+              value={limites.buzon_quota_mb}
+              onChange={(e) => setLimites((l) => ({ ...l, buzon_quota_mb: e.target.value }))}
+              hint="Espacio para el correo entrante (mensajes y adjuntos) de cada subcuenta que no tenga cuota propia. Al llenarse, su buzón deja de sincronizar hasta que borren correo. La cuota de una subcuenta concreta se cambia en Subcuentas."
             />
           </div>
         </div>

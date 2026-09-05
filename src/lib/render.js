@@ -21,6 +21,7 @@ import { haySeguimiento, nuevoTokenEnlace, urlBaja, urlClic, urlPixel } from './
 const MAX_ASUNTO = 500
 const MAX_NOMBRE_VISIBLE = 70 // límite de Brevo para el nombre del remitente y del destinatario
 const MAX_CABECERA = 900
+const MAX_CABECERA_HILO = 4000 // References acumula un <id> por cada vuelta del hilo
 const MAX_URL = 2000
 
 const texto = (v) => (v === undefined || v === null ? '' : String(v)).trim()
@@ -410,11 +411,18 @@ export function componerMensaje(mensaje, opciones = {}) {
   // `opciones.baja` manda en los dos sentidos: permite forzarla o quitarla desde quien compone.
   const bajaPedida = opciones.baja === undefined ? texto(m.origin) === 'relay' : opciones.baja !== false
   const enlaceBaja = activo && bajaPedida ? urlBaja(m.id, dominioTracking) : ''
-  const cabeceras = cabecerasDeMensaje({
-    correlationId: m.correlation_id,
-    enlaceBaja,
-    correoBaja: replyToBruto || de.email,
-  })
+  // Una respuesta escrita a mano desde el buzón (SPEC §14) es correo personal: no lleva
+  // List-Unsubscribe (Gmail pintaría «Cancelar suscripción» sobre una contestación humana).
+  const esBuzon = texto(m.origin) === 'buzon'
+  // Las cabeceras de hilo (extra_headers) van primero: las de la app nunca pueden quedar pisadas.
+  const cabeceras = {
+    ...cabecerasExtra(m.extra_headers),
+    ...cabecerasDeMensaje({
+      correlationId: m.correlation_id,
+      enlaceBaja,
+      correoBaja: esBuzon ? '' : replyToBruto || de.email,
+    }),
+  }
 
   return {
     correlationId: texto(m.correlation_id),
@@ -432,6 +440,83 @@ export function componerMensaje(mensaje, opciones = {}) {
     enlaceBaja: enlaceBaja || null,
     etiquetas: Array.isArray(opciones.etiquetas) ? opciones.etiquetas.filter(Boolean).map(String) : undefined,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cabeceras extra (messages.extra_headers, SPEC §14): las respuestas desde el buzón viajan con
+// In-Reply-To y References para que el cliente de correo del destinatario las enhebre.
+//
+// Se admiten solo cabeceras con nombre válido (RFC 5322: letras, dígitos y guiones) y sin saltos
+// de línea, y NUNCA las que fijan la estructura o el enrutado del correo (From, To, Bcc,
+// Content-Type…) ni las que gestiona la propia app: esas las decide el mensaje, no un jsonb.
+// ---------------------------------------------------------------------------
+
+const RE_NOMBRE_CABECERA = /^[A-Za-z][A-Za-z0-9-]{0,78}$/
+const CABECERAS_RESERVADAS = new Set([
+  'from', 'to', 'cc', 'bcc', 'subject', 'date', 'sender', 'reply-to', 'return-path', 'message-id',
+  'received', 'mime-version', 'content-type', 'content-transfer-encoding', 'content-disposition',
+  'content-id', 'content-length', 'dkim-signature', 'authentication-results', 'x-mailin-custom',
+  'x-correlation-id', 'list-unsubscribe', 'list-unsubscribe-post',
+])
+const CABECERAS_DE_HILO = new Set(['in-reply-to', 'references'])
+
+/** Ids de mensaje de una cabecera de hilo, cada uno envuelto en <…> exactamente una vez. */
+function idsDeHilo(valor) {
+  const vistos = new Set()
+  const salida = []
+  for (const parte of texto(valor).split(/\s+/)) {
+    const id = parte.replace(/^<+/, '').replace(/>+$/, '').trim()
+    if (!id || /[\s<>]/.test(id) || vistos.has(id)) continue
+    vistos.add(id)
+    salida.push(`<${id}>`)
+  }
+  return salida
+}
+
+/**
+ * Normaliza `extra_headers` (objeto {nombre: valor}, o lista de [nombre, valor] / {nombre, valor})
+ * a un objeto de cabeceras seguras. Lo desconocido, lo reservado y lo vacío se descarta en
+ * silencio. In-Reply-To y References se reescriben como lista de <id> canónica.
+ */
+export function cabecerasExtra(extra) {
+  if (!extra) return {}
+  let entradas = []
+  if (Array.isArray(extra)) {
+    entradas = extra.map((e) =>
+      Array.isArray(e) ? [e[0], e[1]] : e && typeof e === 'object' ? [e.name ?? e.nombre ?? e.key, e.value ?? e.valor] : []
+    )
+  } else if (typeof extra === 'object') {
+    entradas = Object.entries(extra)
+  } else if (typeof extra === 'string') {
+    try {
+      return cabecerasExtra(JSON.parse(extra))
+    } catch {
+      return {}
+    }
+  }
+
+  const salida = {}
+  for (const [nombreBruto, valorBruto] of entradas) {
+    const nombre = texto(nombreBruto)
+    if (!RE_NOMBRE_CABECERA.test(nombre)) continue
+    const clave = nombre.toLowerCase()
+    if (CABECERAS_RESERVADAS.has(clave)) continue
+    if (valorBruto === undefined || valorBruto === null || typeof valorBruto === 'object') continue
+
+    let valor
+    if (CABECERAS_DE_HILO.has(clave)) {
+      const ids = idsDeHilo(valorBruto)
+      if (!ids.length) continue
+      // In-Reply-To lleva un solo id (el mensaje al que se responde); References, toda la cadena
+      valor = limpiarCabecera(clave === 'in-reply-to' ? ids[ids.length - 1] : ids.join(' '), MAX_CABECERA_HILO)
+    } else {
+      valor = limpiarCabecera(valorBruto, MAX_CABECERA)
+    }
+    if (!valor) continue
+    // el nombre se guarda con la capitalización canónica de las de hilo; el resto, tal cual llegó
+    salida[clave === 'in-reply-to' ? 'In-Reply-To' : clave === 'references' ? 'References' : nombre] = valor
+  }
+  return salida
 }
 
 /**

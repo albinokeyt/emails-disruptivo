@@ -246,6 +246,13 @@ if (!workerHabilitado) {
   avisos.push('WORKER_HABILITADO=false: esta instancia no enviará correo, solo servirá la API y el panel.')
 }
 
+// --- Buzón IMAP (SPEC §14.5) ------------------------------------------------
+// Tamaño máximo de un correo entrante: los que lo superen se guardan sin contenido ni adjuntos y
+// con un aviso (así un adjunto de 300 MB no puede tumbar el proceso al parsearlo en memoria).
+// La cuota por subcuenta se aplica cuando ni la subcuenta ni settings.limites fijan una.
+const buzonMaxMensajeMb = entero('BUZON_MAX_MENSAJE_MB', 25, { min: 1, max: 500 })
+const buzonQuotaMbDefault = entero('BUZON_QUOTA_MB_DEFAULT', 200, { min: 1, max: 1_000_000 })
+
 export const config = {
   entorno: texto(process.env.NODE_ENV) || 'production',
   port,
@@ -290,6 +297,13 @@ export const config = {
   worker: {
     habilitado: workerHabilitado,
     concurrencia: workerConcurrencia,
+  },
+  buzon: {
+    // techo de un correo entrante; por encima se guarda solo la cabecera con un aviso
+    maxMensajeMb: buzonMaxMensajeMb,
+    maxMensajeBytes: buzonMaxMensajeMb * 1024 * 1024,
+    // cuota de espacio por subcuenta si no hay una fijada en location_settings ni en settings.limites
+    quotaMbDefault: buzonQuotaMbDefault,
   },
 }
 

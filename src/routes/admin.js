@@ -38,6 +38,8 @@ import { config } from '../config.js'
 import { actualizarCertificado, estadoRelay, hostRelay } from '../smtp-relay/index.js'
 import { asegurarCertificado, estadoCertificado, motivoSinCertificado } from '../lib/acme.js'
 import { comprobarCertificadoTraefik, estadoTraefik } from '../lib/traefik.js'
+// SPEC §14: espacio del buzón de todas las subcuentas y cuota por subcuenta.
+import { tamanoLegible } from '../lib/buzon.js'
 
 // SPEC §5.3 — API del panel de la agencia. Todo bajo requireAdmin salvo el propio login.
 // Los secretos guardados (client_secret, shared_secret, credenciales de proveedor) NUNCA se
@@ -50,9 +52,20 @@ const MAX_NOMBRE = 200
 const MAX_ASUNTO = 500
 const MAX_HTML = 1_000_000
 const MAX_SECRETO = 500
+// Cuota del buzón en MB (SPEC §14): tope generoso pero finito, el disco del VPS no es infinito.
+const MAX_CUOTA_BUZON_MB = 1_000_000
 
 const appBaseUrl = () => String(process.env.APP_BASE_URL || '').replace(/\/+$/, '')
 const malo = (reply, mensaje) => reply.code(400).send({ error: mensaje })
+
+// Cuota efectiva de una subcuenta: la suya (location_settings.buzon_quota_mb) o la global.
+const cuotaEfectivaMb = (propia, defecto) => (Number.isInteger(propia) && propia > 0 ? propia : defecto)
+// Porcentaje de uso con un decimal; puede pasar de 100 si la cuota se bajó por debajo de lo usado.
+const porcentajeUso = (usadoBytes, cuotaMb) => {
+  const total = Number(cuotaMb) * 1024 * 1024
+  if (!(total > 0)) return 0
+  return Math.round((Number(usadoBytes) / total) * 1000) / 10
+}
 
 // La guarda vive en src/lib/auth.js (y allí corta también las peticiones cruzadas).
 // Se reexporta para no romper a quien la importe desde aquí.
@@ -710,6 +723,96 @@ export default async function adminRoutes(app) {
   })
 
   // ---------------------------------------------------------------------------
+  // Buzón (SPEC §14): espacio usado por cada subcuenta y cuota individual
+  // ---------------------------------------------------------------------------
+  const filaEspacio = (f, porDefectoMb) => {
+    const usado = Number(f.usado_bytes) || 0
+    const propia = f.buzon_quota_mb === null || f.buzon_quota_mb === undefined ? null : Number(f.buzon_quota_mb)
+    const efectiva = cuotaEfectivaMb(propia, porDefectoMb)
+    return {
+      location_id: f.location_id,
+      nombre: f.name || null,
+      estado_app: f.status,
+      usado_bytes: usado,
+      usado_legible: tamanoLegible(usado),
+      quota_mb: propia,
+      cuota_efectiva_mb: efectiva,
+      cuota_legible: tamanoLegible(efectiva * 1024 * 1024),
+      porcentaje: porcentajeUso(usado, efectiva),
+      cuentas: f.cuentas,
+      cuentas_llenas: f.cuentas_llenas,
+      mensajes: f.mensajes,
+    }
+  }
+
+  app.get('/api/admin/buzon/espacio', guard, async () => {
+    const [limites, { rows }] = await Promise.all([
+      getLimites(),
+      q(
+        `SELECT c.location_id, c.name, c.status,
+                ls.buzon_quota_mb,
+                COALESCE(ls.buzon_used_bytes, 0)::bigint AS usado_bytes,
+                (SELECT COUNT(*)::int FROM mailboxes b WHERE b.location_id = c.location_id) AS cuentas,
+                (SELECT COUNT(*)::int FROM mailboxes b
+                   WHERE b.location_id = c.location_id AND b.status = 'cuota_llena') AS cuentas_llenas,
+                (SELECT COUNT(*)::int FROM inbox_messages m WHERE m.location_id = c.location_id) AS mensajes
+           FROM connections c
+           LEFT JOIN location_settings ls ON ls.location_id = c.location_id
+          ORDER BY COALESCE(ls.buzon_used_bytes, 0) DESC, c.name NULLS LAST, c.location_id`
+      ),
+    ])
+    const subcuentas = rows.map((f) => filaEspacio(f, limites.buzon_quota_mb))
+    const totalBytes = subcuentas.reduce((acc, s) => acc + s.usado_bytes, 0)
+    return {
+      por_defecto_mb: limites.buzon_quota_mb,
+      total_usado_bytes: totalBytes,
+      total_usado_legible: tamanoLegible(totalBytes),
+      subcuentas,
+    }
+  })
+
+  // {quota_mb: n} fija una cuota propia; {quota_mb: null} vuelve al valor por defecto de Ajustes.
+  app.patch('/api/admin/subcuentas/:locationId/buzon', guard, async (req, reply) => {
+    const locationId = texto(req.params.locationId)
+    if (!locationId || locationId.length > 100) return malo(reply, 'Falta la subcuenta')
+    if (!(await subcuentaExiste(locationId))) {
+      return reply.code(404).send({ error: 'Esa subcuenta no tiene la app instalada' })
+    }
+    const b = req.body || {}
+    const bruto = b.quota_mb !== undefined ? b.quota_mb : b.buzon_quota_mb
+    if (bruto === undefined) return malo(reply, 'Indica «quota_mb» (un número de MB, o null para usar la cuota por defecto)')
+    let cuota = null
+    if (bruto !== null && bruto !== '') {
+      const n = Number(bruto)
+      if (!Number.isInteger(n) || n < 1 || n > MAX_CUOTA_BUZON_MB) {
+        return malo(reply, `La cuota del buzón tiene que ser un número entero de MB entre 1 y ${MAX_CUOTA_BUZON_MB.toLocaleString('es-ES')}, o null para la cuota por defecto`)
+      }
+      cuota = n
+    }
+    const [limites, { rows: [fila] }] = await Promise.all([
+      getLimites(),
+      q(
+        `INSERT INTO location_settings (location_id, buzon_quota_mb) VALUES ($1, $2)
+         ON CONFLICT (location_id) DO UPDATE SET buzon_quota_mb = EXCLUDED.buzon_quota_mb, updated_at = now()
+         RETURNING buzon_quota_mb, buzon_used_bytes`,
+        [locationId, cuota]
+      ),
+    ])
+    const usado = Number(fila.buzon_used_bytes) || 0
+    const efectiva = cuotaEfectivaMb(cuota, limites.buzon_quota_mb)
+    // Si la cuota nueva vuelve a dar aire a un buzón que se paró por espacio, la sincronización
+    // lo retoma sola: el estado 'cuota_llena' lo reevalúa el bucle en la siguiente pasada.
+    return {
+      location_id: locationId,
+      quota_mb: cuota,
+      cuota_efectiva_mb: efectiva,
+      usado_bytes: usado,
+      usado_legible: tamanoLegible(usado),
+      porcentaje: porcentajeUso(usado, efectiva),
+    }
+  })
+
+  // ---------------------------------------------------------------------------
   // Relay de la plataforma y certificado TLS (SPEC §13.3)
   // ---------------------------------------------------------------------------
 
@@ -933,7 +1036,12 @@ export default async function adminRoutes(app) {
         dinamico_plantilla: `${base}/api/ghl/dinamico/plantilla/${actionSecret}`,
         dinamico_personalizado: `${base}/api/ghl/dinamico/personalizado/${actionSecret}`,
       },
-      limites: { envio_minuto: limites.envio_minuto, envio_dia: limites.envio_dia },
+      limites: {
+        envio_minuto: limites.envio_minuto,
+        envio_dia: limites.envio_dia,
+        // cuota de buzón por defecto (SPEC §14): se aplica a toda subcuenta sin cuota propia
+        buzon_quota_mb: limites.buzon_quota_mb,
+      },
       admins: {
         emails: Array.isArray(admins.emails) ? admins.emails : [],
         company_ids: Array.isArray(admins.company_ids) ? admins.company_ids : [],
@@ -993,6 +1101,13 @@ export default async function adminRoutes(app) {
           return malo(reply, `El límite «${campo}» tiene que ser un número entero entre 1 y 1.000.000`)
         }
         limites[campo] = n
+      }
+      if (b.limites.buzon_quota_mb !== undefined) {
+        const n = Number(b.limites.buzon_quota_mb)
+        if (!Number.isInteger(n) || n < 1 || n > MAX_CUOTA_BUZON_MB) {
+          return malo(reply, `La cuota de buzón por defecto tiene que ser un número entero de MB entre 1 y ${MAX_CUOTA_BUZON_MB.toLocaleString('es-ES')}`)
+        }
+        limites.buzon_quota_mb = n
       }
       await setSetting('limites', limites)
     }

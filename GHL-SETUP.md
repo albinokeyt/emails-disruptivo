@@ -130,6 +130,14 @@ subcuentas donde la app está instalada, y no consume ningún scope**.
 No pongas `?location_id={{location.id}}` ni ninguna otra variable en la URL. El `locationId` llega
 por el SSO cifrado; un parámetro de URL es falsificable y la app lo ignora.
 
+**El Buzón (correo entrante por IMAP) no necesita nada más en GHL.** Vive dentro de esta misma
+Custom Page, en la entrada «Buzón» del menú del panel: ni otra página, ni scopes, ni un servicio de
+email nuevo. Lo único que hace falta es que el cliente conecte su cuenta de correo desde el
+engranaje de esa pantalla (servidor IMAP, puerto 993 con TLS, usuario y contraseña); con Gmail y
+Outlook la contraseña tiene que ser una **contraseña de aplicación** con la verificación en dos pasos
+activada, no la de la cuenta. Las respuestas salen por los remitentes y proveedores de la subcuenta,
+así que aparecen en *Envíos* como cualquier otro correo. Detalle en el README, sección «Buzón».
+
 > **Sin confirmar.** La documentación de Custom Pages no enumera los campos exactos del formulario
 > (etiqueta, icono, selector de placement) ni dice cuántas páginas admite una app — una fuente de
 > terceros afirma que solo se puede tener **una**. **Cómo verificarlo:** abre *Modules → Custom Pages*
@@ -548,3 +556,7 @@ transaccionales). Los webhooks de entrega, rebote y spam no se ven afectados: si
       `openssl s_client -starttls smtp -connect <host>:587` devuelve `Verify return code: 0 (ok)`, y
       el servicio SMTP guardado en la subcuenta de pruebas con el puerto `587` envía un correo desde
       *Conversations* que aparece en *Envíos* con origen «Relay SMTP».
+- [ ] *(Solo si usas el buzón)* En la subcuenta de pruebas, panel → Buzón → engranaje: la cuenta
+      IMAP pasa «Probar conexión», «Sincronizar ahora» trae correo, y una respuesta desde el hilo
+      aparece en *Envíos* con origen «Buzón» y llega a `entregado`. En admin → Ajustes hay una cuota
+      de buzón por defecto puesta (200 MB si no tocas nada).

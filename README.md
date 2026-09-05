@@ -79,6 +79,75 @@ minuto y por día, lista de supresión y cabeceras `List-Unsubscribe` + `List-Un
 
 ---
 
+## Buzón: correo entrante por IMAP
+
+Las tres vías de arriba son de **salida**. El **Buzón** es la de entrada: la subcuenta conecta una o
+varias cuentas de correo (Gmail, Outlook, el buzón de su dominio…) y la app se trae los mensajes por
+IMAP, los guarda, los enseña en hilos tipo Gmail dentro del panel (entrada «Buzón» del menú, con
+contador de no leídos) y permite responderlos con los remitentes y proveedores que ya existen. No
+hay que configurar nada en GHL: vive dentro de la misma Custom Page.
+
+### Qué hace
+
+- **Sincroniza sola.** Un bucle dentro del worker (`src/lib/buzon-sync.js`) revisa cada minuto qué
+  cuentas tocan según su intervalo (5 min por defecto) y trae solo lo nuevo (`uid > last_uid`, con
+  reinicio si cambia `UIDVALIDITY`), con un lock por cuenta en Redis para que dos instancias no
+  sincronicen la misma. Dedupe por `(mailbox_id, uid)` y por `Message-ID`. «Sincronizar ahora»
+  fuerza una pasada. Los errores se quedan en `mailboxes.status='error'` + `last_error`, visibles
+  en el engranaje de la pantalla, sin tumbar el worker.
+- **Guarda cuerpo parseado + adjuntos, no el mensaje crudo.** El HTML se sanea en el servidor
+  (`sanitize-html`: sin scripts, formularios ni estilos peligrosos) y el panel lo pinta en un
+  `<iframe sandbox>` con las **imágenes remotas bloqueadas** hasta que el usuario pulsa «Cargar
+  imágenes» (así el remitente no sabe que se ha abierto). Los adjuntos viven en Postgres
+  (`inbox_attachments.content`) y se descargan con `Content-Disposition: attachment` y
+  `X-Content-Type-Options: nosniff`. Un mensaje que supere `BUZON_MAX_MENSAJE_MB` (25) se guarda sin
+  adjuntos y el panel lo avisa.
+- **Hilos.** `thread_key` = primer id de `References` o el propio `Message-ID`. El detalle enseña
+  los recibidos del hilo y nuestras respuestas con su estado de entrega (`encolado` → `entregado`…).
+- **Responder / responder a todos / reenviar** = una fila más en `messages` con `origin='buzon'`,
+  `In-Reply-To` y `References` en `extra_headers`, `thread_key` e `inbox_reply_to_id`. Sale por el
+  remitente configurado en la cuenta (`reply_sender_id`) o por el remitente por defecto de la
+  subcuenta; pasa por la lista de supresión y por los límites como cualquier otro correo, y aparece
+  en *Envíos* y en la carpeta «Enviados desde el buzón». El original se cita al final. Reenviar no
+  lleva los adjuntos del original (v1): el panel lo avisa.
+
+### IMAP, no POP3
+
+POP3 descarga y, normalmente, borra: el correo deja de estar en la cuenta original y no hay forma de
+saber qué es nuevo sin bajarlo todo otra vez. IMAP mantiene el correo en el servidor, tiene UIDs
+estables para traer solo lo que falta, avisa cuando el buzón se ha reconstruido (`UIDVALIDITY`) y
+permite borrar en remoto un mensaje concreto. Por eso el buzón habla solo IMAP: `993` con TLS
+(recomendado) o `143` con STARTTLS.
+
+### Dejar copia o borrar del servidor
+
+Al configurar cada cuenta se elige qué hacer con cada mensaje después de traerlo:
+
+| Opción | Qué pasa | Cuándo usarla |
+|---|---|---|
+| **Dejar una copia en el servidor** (por defecto) | El correo sigue en la cuenta original y aquí se guarda una copia. Ocupa espacio en los dos sitios. | Casi siempre: el buzón de la app es una vista cómoda, no el único sitio donde está el correo. |
+| **Borrar del servidor una vez traído** (`delete_after_import`) | Se marca `\Deleted` y se hace `EXPUNGE` nada más importarlo. Solo queda en la app. | Cuentas dedicadas (`soporte@…`) cuyo buzón original se llena o nadie mira. Si luego se borra en el panel, se pierde de verdad. |
+
+Al borrar un mensaje desde el panel se puede marcar «también del servidor»: si su UID sigue
+existiendo en la cuenta, se borra también allí. Sin marcarlo, allí se queda.
+
+### Cuota de espacio
+
+Cada subcuenta tiene una cuota (`location_settings.buzon_quota_mb`; si es `NULL` manda el valor por
+defecto de *Ajustes → límites → «Cuota de buzón por defecto»*, 200 MB). `buzon_used_bytes` es un
+contador cacheado (mensajes + adjuntos) que se actualiza al insertar y al borrar. Si un mensaje no
+cabe, la sincronización de esa cuenta se detiene, el buzón pasa a `cuota_llena` y el panel lo avisa
+(barra «X de Y MB» en ámbar a partir del 70 % y en rojo a partir del 90 %); al borrar correo vuelve a
+arrancar sola. El admin ve el uso de todas las subcuentas en *Subcuentas* (columna «Buzón») y sube o
+baja la cuota de cada una desde ahí.
+
+**Credenciales.** La contraseña IMAP se cifra con AES-256-GCM (`ENCRYPTION_KEY`, igual que las de los
+proveedores), nunca vuelve a mostrarse y nunca se escribe en logs. Gmail y Outlook exigen una
+*contraseña de aplicación* con la verificación en dos pasos activada: la contraseña normal de la
+cuenta no vale, y el propio formulario lo recuerda.
+
+---
+
 ## Arquitectura de un vistazo
 
 Un solo contenedor con tres cosas dentro, y dos almacenes.
@@ -88,6 +157,7 @@ Un solo contenedor con tres cosas dentro, y dos almacenes.
 | **Servidor HTTP (Fastify 5)** | Panel React, API de subcuenta y de admin, endpoints de los nodos de GHL, webhooks de Brevo y tracking (`/t/*`) | — |
 | **Worker de envío** | Reclama mensajes de `messages` con `FOR UPDATE SKIP LOCKED`, inserta el pixel, reescribe enlaces, llama al proveedor y aplica reintentos | `WORKER_HABILITADO=false` |
 | **Relay SMTP** | Servidor `smtp-server` con dos escuchas (STARTTLS y SSL) que recibe el correo del nodo nativo de GHL y lo mete en la misma cola. Su certificado TLS lo lee del `acme.json` de Traefik (que ya lo renueva) o, sin Traefik delante, lo emite la app por ACME HTTP-01; en ambos casos se aplica en caliente | `SMTP_RELAY_ENABLED=false` (por defecto) |
+| **Sincronizador del buzón** | Bucle dentro del worker que trae por IMAP (`imapflow`) el correo de las cuentas configuradas, lo parsea, lo sanea y lo guarda respetando la cuota de cada subcuenta; lock por cuenta en Redis | con el worker (`WORKER_HABILITADO=false`) |
 | **Postgres** | Fuente única de verdad **y** cola de envío. Las migraciones corren solas al arrancar | — |
 | **Redis** | Sesiones, locks (refresco de token OAuth, worker) y límites de envío por subcuenta | — |
 
@@ -141,9 +211,12 @@ emails-disruptivo/
 │  ├─ migrations/
 │  │  ├─ 001_init.sql     esquema base (idempotente, cada una se aplica una sola vez)
 │  │  ├─ 002_tracking.sql · 003_rebotados.sql
-│  │  └─ 004_tls.sql      tabla tls_certificates (certificado del relay, clave cifrada)
+│  │  ├─ 004_tls.sql      tabla tls_certificates (certificado del relay, clave cifrada)
+│  │  └─ 005_buzon.sql    mailboxes, inbox_messages, inbox_attachments, cuota y origen 'buzon'
 │  ├─ lib/
 │  │  ├─ crypto.js        AES-256-GCM para credenciales · scrypt para el relay
+│  │  ├─ buzon.js         buzón: saneado del HTML, thread_key, cuota y borrado con descuento
+│  │  ├─ buzon-sync.js    bucle IMAP del buzón: sincronizar, probar, borrar en el servidor
 │  │  ├─ acme.js          certificado Let's Encrypt del relay: emisión, estado y renovación
 │  │  ├─ sso.js           descifrado del contexto de usuario de GHL
 │  │  ├─ ghl.js           OAuth, refresco de token con lock, llamadas a la API
@@ -169,6 +242,7 @@ emails-disruptivo/
 │     ├─ oauth.js         instalación, callback y sesión por SSO
 │     ├─ acme.js          /.well-known/acme-challenge/:token — reto HTTP-01
 │     ├─ location.js      /api/loc/*  — panel de subcuenta
+│     ├─ buzon.js         /api/loc/buzon/* — cuentas IMAP, mensajes, adjuntos, respuestas, espacio
 │     ├─ admin.js         /api/admin/* — panel de la agencia
 │     ├─ actions.js       /api/ghl/*  — nodos y campos Dynamic
 │     ├─ webhooks.js      /api/webhooks/brevo/:token
@@ -179,7 +253,7 @@ emails-disruptivo/
       ├─ components/ui.jsx    Boton, Campo, Select, Textarea, Interruptor, Modal,
       │                       Tabla, Badge, Aviso, Spinner, Confirmar, Copiar
       └─ pages/               Resumen, Proveedores, Remitentes, Plantillas, Envios,
-                              Relay, Dominios + las de /admin/*
+                              Buzon, Relay, Dominios + las de /admin/*
 ```
 
 ---
@@ -209,6 +283,7 @@ emails-disruptivo/
 | `SMTP_BOUNCE_DOMAIN` | no | — | activa VERP y la captura de rebotes por el relay (puerto 25) |
 | `ENVIO_LIMITE_MINUTO` | no | `60` | tope de envíos por subcuenta y minuto |
 | `ENVIO_LIMITE_DIA` | no | `5000` | tope de envíos por subcuenta y día |
+| `BUZON_MAX_MENSAJE_MB` | no | `25` | tamaño máximo de un correo entrante del buzón; los que lo superan se guardan sin adjuntos y con aviso |
 | `WORKER_CONCURRENCIA` | no | `5` | mensajes en paralelo |
 | `WORKER_HABILITADO` | no | `true` | ponlo a `false` para escalar workers en un servicio aparte |
 
@@ -364,3 +439,7 @@ Los pasos 4 a 13 son idénticos. Lo único que cambia es la entrada:
   `sender_domains`). Es el guardarraíl que impide que un cliente envíe desde el dominio de otro.
 - El redirector de clics solo acepta tokens que estén en `message_links`: no es un redirector abierto.
 - Los tokens de OAuth de GHL viven en tu Postgres. Mantén el repo y las copias de seguridad privados.
+- El buzón trata el correo entrante como hostil: HTML saneado en el servidor antes de guardarlo,
+  pintado en un `<iframe sandbox>` sin scripts ni navegación, imágenes remotas bloqueadas por
+  defecto y adjuntos servidos solo como descarga (`nosniff`). La contraseña IMAP va cifrada como
+  las credenciales de los proveedores y nunca se devuelve ni se registra en logs.

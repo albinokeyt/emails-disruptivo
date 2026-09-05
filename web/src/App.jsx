@@ -16,6 +16,7 @@ import Envios from './pages/Envios.jsx'
 import Rebotados from './pages/Rebotados.jsx'
 import Relay from './pages/Relay.jsx'
 import Dominios from './pages/Dominios.jsx'
+import Buzon from './pages/Buzon.jsx'
 
 // Pantallas de la agencia (SPEC §9)
 import Login from './pages/Login.jsx'
@@ -113,6 +114,8 @@ function PanelSubcuenta() {
           <Route path="/envios" element={<Envios />} />
           <Route path="/envios/:id" element={<Envios />} />
           <Route path="/rebotados" element={<Rebotados />} />
+          <Route path="/buzon" element={<Buzon />} />
+          <Route path="/buzon/:id" element={<Buzon />} />
           <Route path="/relay" element={<Relay />} />
           <Route path="/dominios" element={<Dominios />} />
           <Route path="*" element={<Navigate to="/" replace />} />
