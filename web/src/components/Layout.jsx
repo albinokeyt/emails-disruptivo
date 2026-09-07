@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
-  AtSign, Building2, FileText, Globe, Inbox, LayoutDashboard, LogOut, Mail, MailX, Menu,
+  AtSign, Building2, CalendarClock, FileText, Globe, Inbox, LayoutDashboard, LogOut, Mail, MailX, Menu,
   Send, Server, Settings, Share2, ShieldCheck, Users, X,
 } from 'lucide-react'
 import { contarNoLeidosBuzon } from '../api.js'
@@ -217,6 +217,13 @@ export default function Layout({ ambito = 'location', sesion = null, onSalir, ch
           </header>
 
           <main className="flex-1 min-w-0 p-5 lg:p-8 overflow-x-hidden">
+            {/* Aviso discreto de vencimiento de la suscripción (GET /api/sesion → acceso.aviso): no bloquea nada */}
+            {!esAdmin && sesion?.acceso?.aviso && (
+              <div className="mb-4 flex items-center gap-2 rounded-xl border border-warn/25 bg-warn/5 px-3.5 py-2 text-xs text-ink2">
+                <CalendarClock size={14} className="text-warn shrink-0" />
+                <span>{sesion.acceso.aviso}</span>
+              </div>
+            )}
             <div key={ubicacion.pathname} className="animate-in">{children}</div>
           </main>
         </div>

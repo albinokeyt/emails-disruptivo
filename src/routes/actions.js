@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { q } from '../db.js'
 import { consumirLimiteEnvio } from '../lib/ratelimit.js'
 import { filtrarSuprimidos } from '../lib/suppression.js'
+import { MENSAJE_SIN_ACCESO, tieneAcceso } from '../lib/marketplace.js'
 
 // Nodos de workflow de GHL (Custom Workflow Actions).
 //   POST /api/ghl/accion/plantilla/:secreto        → ejecución del nodo "Enviar email con plantilla"
@@ -251,6 +252,12 @@ async function ejecutar(req, reply, origen) {
     const locationId = texto(extras.locationId)
 
     await subcuentaViva(locationId)
+
+    // Suscripción en el Marketplace Disruptivo: segundo punto de corte, antes de aceptar el envío.
+    // 400 (error de configuración, se lee en el log del workflow) con el texto literal: nada de
+    // códigos HTTP ni detalles técnicos. tieneAcceso nunca lanza y nunca corta por un fallo reciente.
+    const acceso = await tieneAcceso(locationId, { log: req.log })
+    if (!acceso.access) throw fallo(400, MENSAJE_SIN_ACCESO)
 
     const destino = normalizarEmail(leerCampo(data, 'to_email', 'para', 'destinatario', 'email'))
     if (!destino) throw fallo(400, 'Falta el destinatario (to_email) en la configuración del nodo')

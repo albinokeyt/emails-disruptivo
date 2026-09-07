@@ -253,6 +253,37 @@ if (!workerHabilitado) {
 const buzonMaxMensajeMb = entero('BUZON_MAX_MENSAJE_MB', 25, { min: 1, max: 500 })
 const buzonQuotaMbDefault = entero('BUZON_QUOTA_MB_DEFAULT', 200, { min: 1, max: 1_000_000 })
 
+// --- Marketplace Disruptivo (suscripción) -----------------------------------
+// Emails Disruptivo se vende por suscripción desde el Marketplace Disruptivo. Esta app NO cobra
+// nada: solo pregunta GET /api/v1/access/{locationId} y sirve o corta (src/lib/marketplace.js).
+//
+// Sin MD_API_KEY no se corta a nadie (todas las subcuentas con acceso, fuente «sin_clave»): un
+// despliegue sin la variable no puede dejar a los clientes sin servicio. Se avisa en el arranque.
+const MD_BASE_URL_DEFECTO = 'https://marketplace.escaladoacelerado.es'
+const mdBaseUrlBruta = texto(process.env.MD_BASE_URL).replace(/\/+$/, '')
+let mdBaseUrl = MD_BASE_URL_DEFECTO
+if (mdBaseUrlBruta) {
+  try {
+    const u = new URL(mdBaseUrlBruta)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('esquema')
+    mdBaseUrl = mdBaseUrlBruta
+  } catch {
+    problemas.push(`MD_BASE_URL="${mdBaseUrlBruta}" no es una URL válida (p. ej. ${MD_BASE_URL_DEFECTO}).`)
+  }
+}
+const mdApiKey = texto(process.env.MD_API_KEY)
+// tope de 300 s a propósito: el admin del marketplace da y quita accesos en caliente y tienen que
+// notarse en 5 minutos como mucho
+const mdCacheSeg = entero('MD_CACHE_SEG', 300, { min: 1, max: 300 })
+const mdGraciaHoras = entero('MD_GRACIA_HORAS', 24, { min: 1, max: 720 })
+const mdTimeoutMs = entero('MD_TIMEOUT_MS', 5000, { min: 500, max: 60_000 })
+if (!mdApiKey) {
+  avisos.push(
+    'MD_API_KEY no está definida: no se comprueba la suscripción en el Marketplace Disruptivo y TODAS las ' +
+      'subcuentas tienen acceso. Define la clave de la API del marketplace para activar el corte por suscripción.'
+  )
+}
+
 export const config = {
   entorno: texto(process.env.NODE_ENV) || 'production',
   port,
@@ -304,6 +335,15 @@ export const config = {
     maxMensajeBytes: buzonMaxMensajeMb * 1024 * 1024,
     // cuota de espacio por subcuenta si no hay una fijada en location_settings ni en settings.limites
     quotaMbDefault: buzonQuotaMbDefault,
+  },
+  marketplace: {
+    baseUrl: mdBaseUrl,
+    // la clave no se expone en ningún log ni respuesta: solo la lee lib/marketplace.js para la cabecera
+    apiKey: mdApiKey || null,
+    configurado: Boolean(mdApiKey),
+    cacheSeg: mdCacheSeg,
+    graciaHoras: mdGraciaHoras,
+    timeoutMs: mdTimeoutMs,
   },
 }
 

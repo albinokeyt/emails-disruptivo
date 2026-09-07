@@ -57,6 +57,10 @@ una desde el panel (el certificado, en cambio, se vuelve a emitir solo). No la r
 | `ENVIO_LIMITE_DIA` | *(opcional)* `5000` |
 | `WORKER_CONCURRENCIA` | *(opcional)* `5` |
 | `WORKER_HABILITADO` | *(opcional)* `true` |
+| `MD_API_KEY` | clave de la API del **Marketplace Disruptivo** (la app se vende por suscripción: con ella se comprueba el acceso de cada subcuenta). **Sin ella no se corta a nadie** y se avisa en el log |
+| `MD_BASE_URL` | *(opcional)* `https://marketplace.escaladoacelerado.es` |
+| `MD_CACHE_SEG` | *(opcional)* `300` — cache del acceso por subcuenta, 300 como máximo |
+| `MD_GRACIA_HORAS` | *(opcional)* `24` — horas que se mantiene el último resultado si el marketplace no responde |
 | `SMTP_RELAY_ENABLED` | `false` hasta que quieras el relay; entonces `true` y sigue la sección **D** |
 
 El **host interno** de Postgres y Redis te lo muestra EasyPanel en cada servicio (suele coincidir con

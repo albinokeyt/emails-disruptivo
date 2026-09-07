@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
-import { Mail, RefreshCw, ShieldAlert } from 'lucide-react'
+import { Lock, Mail, RefreshCw, ShieldAlert } from 'lucide-react'
 import { adminSalir, adminYo, obtenerSesion } from './api.js'
 import { estamosEmbebidos, iniciarSesionConSso } from './sso.js'
 import { SesionContexto } from './hooks.js'
@@ -101,6 +101,12 @@ function PanelSubcuenta() {
         onReintentar={arrancar}
       />
     )
+  }
+
+  // Suscripción en el Marketplace Disruptivo: el backend lo decide (GET /api/sesion → acceso).
+  // Sin acceso no se pinta el panel, solo el mensaje literal del encargo.
+  if (sesion.acceso && sesion.acceso.activo === false) {
+    return <PantallaSinAcceso mensaje={sesion.acceso.mensaje} onReintentar={arrancar} />
   }
 
   return (
@@ -216,6 +222,28 @@ function PantallaCarga({ texto }) {
         <div className="flex items-center gap-2.5 text-sm text-mut">
           <span className="w-4 h-4 rounded-full border-2 border-border border-t-gold spin" />
           {texto}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PantallaSinAcceso({ mensaje, onReintentar }) {
+  return (
+    <div className="min-h-screen grid place-items-center relative p-6">
+      <div className="app-bg" aria-hidden="true" />
+      <div className="relative z-10 w-full max-w-md bg-card border border-border rounded-2xl p-6 space-y-4 animate-in">
+        <div className="flex items-center gap-3">
+          <span className="w-10 h-10 rounded-xl bg-gold/15 border border-gold/30 grid place-items-center shrink-0">
+            <Lock size={18} className="text-gold" />
+          </span>
+          <h1 className="text-base font-semibold">Suscripción no activa</h1>
+        </div>
+        <Aviso tipo="aviso">
+          {mensaje || 'Tu suscripción a Emails Disruptivo no está activa. Habla con el Departamento Disruptivo para reactivarla.'}
+        </Aviso>
+        <div className="flex gap-2 pt-1">
+          <Boton icono={RefreshCw} onClick={onReintentar}>Volver a comprobar</Boton>
         </div>
       </div>
     </div>

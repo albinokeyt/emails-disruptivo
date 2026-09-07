@@ -9,6 +9,7 @@ import { filtrarSuprimidos } from '../lib/suppression.js'
 import { escaparHtml, textoDesdeHtml } from '../lib/render.js'
 import { borrarMensajeBuzon, cuotaDe, recalcularUso, tamanoLegible } from '../lib/buzon.js'
 import { borrarEnServidor, probarBuzon, sincronizarBuzon } from '../lib/buzon-sync.js'
+import { MENSAJE_SIN_ACCESO, tieneAcceso } from '../lib/marketplace.js'
 // Las mismas utilidades de validación que el resto del panel de subcuenta (y que reutiliza admin.js).
 import { cabecera, esEmail, idDe, paginar, texto } from './location.js'
 
@@ -574,6 +575,11 @@ function replyToDe(remitente, cuentaEmail) {
 async function encolarDesdeBuzon({
   locationId, log, original, remitente, proveedor, destino, nombreDestino, cc, bcc, asunto, html, text,
 }) {
+  // Suscripción en el Marketplace Disruptivo: responder o reenviar desde el buzón también es un
+  // envío, así que se corta aquí con el texto literal (403: la sesión sigue siendo válida).
+  const acceso = await tieneAcceso(locationId, { log })
+  if (!acceso.access) throw fallo(403, MENSAJE_SIN_ACCESO)
+
   // Lista de supresión: se comprueban TODOS los destinatarios, no solo el principal. El mensaje se
   // guarda igualmente aunque no salga, para que quede rastro en el hilo y en el historial.
   const bloqueados = await filtrarSuprimidos(locationId, [destino, ...cc, ...bcc])

@@ -1,4 +1,5 @@
 import { q } from '../db.js'
+import { MENSAJE_SIN_ACCESO, tieneAcceso } from '../lib/marketplace.js'
 
 // ---------------------------------------------------------------------------
 // Enrutado del relay SMTP (SPEC §6).
@@ -11,6 +12,7 @@ import { q } from '../db.js'
 //
 // Cadena de resolución:
 //   1) la autenticación (auth.js) ya ha dado el location_id
+//   1b) suscripción en el Marketplace Disruptivo (lib/marketplace.js) → 451 con el texto literal
 //   2) dominio del `From` verificado por OTRA subcuenta → 550 (único rechazo duro)
 //   3) `From` en senders por (location_id, email)          → se usa su provider_id  ← caso normal
 //   4) accept_unknown_senders → alta automática del remitente (origin='auto') y se envía
@@ -157,10 +159,11 @@ export async function suprimidos(locationId, direcciones) {
  * @param {object} args.cuenta       fila de relay_accounts (con default_provider_id y flags)
  * @param {string} args.from         dirección del `From` del mensaje
  * @param {string} [args.nombre]     nombre visible del `From`
+ * @param {object} [args.log]        logger de la sesión (para los avisos de la comprobación de suscripción)
  * @returns {Promise<{ok:true, sender:object, providerId:number, altaAutomatica:boolean}
  *                 | {ok:false, codigo:number, mensaje:string}>}
  */
-export async function resolverRuta({ locationId, cuenta, from, nombre }) {
+export async function resolverRuta({ locationId, cuenta, from, nombre, log }) {
   const email = normalizarDireccion(from)
 
   // Sin un `From` legible no hay nada que enrutar y reintentar no lo va a arreglar: es un mensaje
@@ -177,6 +180,13 @@ export async function resolverRuta({ locationId, cuenta, from, nombre }) {
   if (!cuenta.enabled) {
     return rechazo(451, 'El relay SMTP esta desactivado en el panel de la app de email')
   }
+
+  // ── Paso 1b: la suscripción en el Marketplace Disruptivo ──────────────────
+  // Segundo punto de corte (antes de aceptar un envío). 451 temporal y no 550: al reactivar la
+  // suscripción GHL reintenta y el correo sale solo. El texto es el literal del encargo; textoSmtp
+  // solo le quita las tildes porque RFC 5321 limita la respuesta a ASCII.
+  const acceso = await tieneAcceso(locationId, { log })
+  if (!acceso.access) return rechazo(451, MENSAJE_SIN_ACCESO)
 
   // ── Paso 2: el dominio. ÚNICO rechazo duro de toda la pasarela ────────────
   // Un dominio verificado pertenece a UNA sola subcuenta (índice único parcial en sender_domains).

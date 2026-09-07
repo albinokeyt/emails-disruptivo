@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { adminCuotaBuzon, adminEspacioBuzon, api, fmtBytes } from '../api.js'
+import { adminCuotaBuzon, adminEspacioBuzon, adminRecomprobarAcceso, api, fmtBytes } from '../api.js'
 import { Aviso, Badge, Boton, Campo, Copiar, Modal, Spinner, Tabla } from '../components/ui.jsx'
 
 const TARJETA = 'bg-card border border-border rounded-2xl p-5'
@@ -78,6 +78,54 @@ function CeldaBuzon({ s, uso, onEditar }) {
   )
 }
 
+// Suscripción en el Marketplace Disruptivo (GET /api/admin/subcuentas → acceso: { activo, fuente,
+// vence_el, plan, estado, motivo, comprobado_en }). El listado se pinta desde lo guardado (cache de
+// 5 min, sin ir al marketplace); `fuente` dice de dónde sale el veredicto: api/cache (último
+// resultado bueno), gracia/provisional (el marketplace no responde y se mantiene el último
+// resultado), sin_comprobar (gracia agotada: cortada), sin_datos (todavía no se ha comprobado:
+// «Recomprobar» pregunta en vivo), sin_clave (MD_API_KEY sin definir). null = desinstalada.
+function estadoAcceso(a) {
+  if (!a) return { estado: 'desconocido', texto: '—' }
+  if (a.fuente === 'sin_clave') return { estado: 'desconocido', texto: 'Sin clave' }
+  if (a.fuente === 'sin_datos') return { estado: 'desconocido', texto: 'Sin datos' }
+  if (!a.activo) return { estado: 'error', texto: a.fuente === 'sin_comprobar' ? 'Sin comprobar' : 'Sin acceso' }
+  if (a.fuente === 'gracia' || a.fuente === 'provisional') return { estado: 'pendiente', texto: 'Activa (gracia)' }
+  return { estado: 'activo', texto: 'Activa' }
+}
+
+function CeldaAcceso({ acceso, ocupado, onRecomprobar }) {
+  const { estado, texto } = estadoAcceso(acceso)
+  const detalle = acceso?.activo
+    ? [acceso.plan, acceso.estado].filter(Boolean).join(' · ')
+    : acceso?.motivo || ''
+  // ends_at ya pasado con acceso activo (comped, gracia del marketplace): informativo, no vence nada
+  const vencido = acceso?.vence_el && new Date(acceso.vence_el).getTime() < Date.now()
+  return (
+    <div className="min-w-36">
+      <div className="flex items-center gap-2 whitespace-nowrap">
+        <Badge estado={estado} texto={texto} titulo={acceso?.motivo || undefined} />
+        {acceso && acceso.fuente !== 'sin_clave' && (
+          <button
+            type="button"
+            className="ml-auto text-[11px] text-gold hover:underline disabled:opacity-40"
+            disabled={ocupado}
+            onClick={onRecomprobar}
+            title="Olvida la cache y vuelve a preguntar al marketplace"
+          >
+            {ocupado ? 'Comprobando…' : 'Recomprobar'}
+          </button>
+        )}
+      </div>
+      {acceso?.activo && acceso.vence_el && (
+        <div className="text-[11px] text-mut mt-0.5 whitespace-nowrap">
+          {vencido ? 'Venció el' : 'Vence el'} {fecha(acceso.vence_el)}
+        </div>
+      )}
+      {detalle && <div className="text-[11px] text-mut mt-0.5 truncate max-w-56" title={detalle}>{detalle}</div>}
+    </div>
+  )
+}
+
 const Dato = ({ etiqueta, valor }) => (
   <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5">
     <div className="text-[11px] text-mut uppercase tracking-wide mb-1">{etiqueta}</div>
@@ -100,17 +148,33 @@ export default function Subcuentas() {
   const [cuota, setCuota] = useState(null) // { subcuenta, valor }
   const [guardandoCuota, setGuardandoCuota] = useState(false)
   const [errorCuota, setErrorCuota] = useState('')
+  const [marketplace, setMarketplace] = useState(null) // { configurado, base_url, cache_seg, gracia_horas }
+  const [recomprobando, setRecomprobando] = useState(null)
 
   const cargar = useCallback(async () => {
     try {
       const d = await api.get('/api/admin/subcuentas')
       setDatos(lista(d, 'subcuentas'))
+      setMarketplace(d?.marketplace || null)
       setError('')
     } catch (e) {
       setError(e.message)
       setDatos([])
     }
   }, [])
+
+  const recomprobarAcceso = async (s) => {
+    setRecomprobando(s.location_id)
+    try {
+      const r = await adminRecomprobarAcceso(s.location_id)
+      setDatos((lista) => (lista || []).map((x) => (x.location_id === s.location_id ? { ...x, acceso: r?.acceso || x.acceso } : x)))
+      setError('')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRecomprobando(null)
+    }
+  }
 
   // el espacio del buzón va aparte: si el endpoint no está, la columna solo enseña «—»
   const cargarEspacio = useCallback(async () => {
@@ -204,6 +268,13 @@ export default function Subcuentas() {
 
       {error && <Aviso variant="error">{error}</Aviso>}
 
+      {marketplace && marketplace.configurado === false && (
+        <Aviso variant="warn">
+          La clave del Marketplace Disruptivo (<code className="text-ink">MD_API_KEY</code>) no está definida: no se
+          comprueba la suscripción y todas las subcuentas tienen acceso.
+        </Aviso>
+      )}
+
       <div className={TARJETA}>
         {datos.length === 0 ? (
           <p className="text-sm text-mut py-10 text-center">
@@ -212,7 +283,7 @@ export default function Subcuentas() {
         ) : filtradas.length === 0 ? (
           <p className="text-sm text-mut py-10 text-center">Ninguna subcuenta coincide con la búsqueda.</p>
         ) : (
-          <Tabla columnas={['Subcuenta', 'Estado', 'Proveedores', 'Remitentes', 'Envíos', 'Buzón', 'Instalada', '']}>
+          <Tabla columnas={['Subcuenta', 'Estado', 'Suscripción', 'Proveedores', 'Remitentes', 'Envíos', 'Buzón', 'Instalada', '']}>
             {filtradas.map((s) => (
               <tr key={s.location_id}>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60">
@@ -221,6 +292,13 @@ export default function Subcuentas() {
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60">
                   <Badge status={s.status} />
+                </td>
+                <td className="px-3 py-2.5 text-sm border-t border-border/60">
+                  <CeldaAcceso
+                    acceso={s.acceso}
+                    ocupado={recomprobando === s.location_id}
+                    onRecomprobar={() => recomprobarAcceso(s)}
+                  />
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 text-right tabular-nums text-ink2">
                   {numero(s.proveedores)}
@@ -275,6 +353,12 @@ export default function Subcuentas() {
             .
           </li>
           <li>Activarles el relay SMTP y entregarles tú mismo las credenciales.</li>
+          <li>
+            Ver si su suscripción en el Marketplace Disruptivo está activa (columna «Suscripción»). Los accesos se dan
+            y se quitan en el marketplace; aquí se pinta lo último que se comprobó (cache de 5 minutos, que cada
+            subcuenta refresca al abrir su panel o enviar). «Sin datos» = aún no se ha comprobado; «Recomprobar»
+            pregunta al marketplace en el acto.
+          </li>
           <li>
             Ajustar la cuota del buzón de cada una (columna «Buzón»). El valor por defecto para todas se cambia en{' '}
             <Link to="/admin/ajustes" className="text-gold hover:underline">

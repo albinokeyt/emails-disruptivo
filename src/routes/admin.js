@@ -1,5 +1,6 @@
 import { q } from '../db.js'
 import { redis } from '../redis.js'
+import { rateLimit } from '../lib/ratelimit.js'
 import { crearSesionAdmin, destruirSesionAdmin } from '../lib/session.js'
 import { requireAdmin } from '../lib/auth.js'
 import { cifrarCredenciales, descifrarCredenciales, safeEqual } from '../lib/crypto.js'
@@ -40,6 +41,8 @@ import { asegurarCertificado, estadoCertificado, motivoSinCertificado } from '..
 import { comprobarCertificadoTraefik, estadoTraefik } from '../lib/traefik.js'
 // SPEC §14: espacio del buzón de todas las subcuentas y cuota por subcuenta.
 import { tamanoLegible } from '../lib/buzon.js'
+// Suscripción de cada subcuenta en el Marketplace Disruptivo (solo lectura y recomprobación).
+import { estadoMarketplace, invalidarAcceso, resumenAccesoAdmin, tieneAcceso } from '../lib/marketplace.js'
 
 // SPEC §5.3 — API del panel de la agencia. Todo bajo requireAdmin salvo el propio login.
 // Los secretos guardados (client_secret, shared_secret, credenciales de proveedor) NUNCA se
@@ -133,7 +136,7 @@ export default async function adminRoutes(app) {
   // ---------------------------------------------------------------------------
   // Subcuentas
   // ---------------------------------------------------------------------------
-  app.get('/api/admin/subcuentas', guard, async () => {
+  app.get('/api/admin/subcuentas', guard, async (req) => {
     const { rows } = await q(
       `SELECT c.id, c.location_id, c.name, c.company_id, c.status, c.created_at, c.updated_at,
               (c.access_token IS NOT NULL) AS con_token,
@@ -151,13 +154,49 @@ export default async function adminRoutes(app) {
          FROM connections c
         ORDER BY c.name NULLS LAST, c.created_at DESC`
     )
-    return { subcuentas: rows.map((s) => ({ ...s, relay_activo: Boolean(s.relay_activo) })) }
+    // Suscripción en el marketplace: SOLO lo guardado (soloCache: Redis/memoria, sin ir a la red).
+    // Con N subcuentas y la cache fría, N llamadas en paralelo al marketplace se comerían su límite
+    // (600/min) y la página tardaría lo que la más lenta; aquí se pinta lo que ya se sabe (la
+    // subcuenta lo refresca al abrir su panel o enviar) y «Recomprobar» es la única llamada en vivo.
+    // Las desinstaladas no se consultan. tieneAcceso nunca lanza.
+    const accesos = await Promise.all(
+      rows.map((s) =>
+        s.status === 'uninstalled' ? null : tieneAcceso(s.location_id, { log: req.log, soloCache: true })
+      )
+    )
+    return {
+      subcuentas: rows.map((s, i) => ({
+        ...s,
+        relay_activo: Boolean(s.relay_activo),
+        acceso: accesos[i] ? resumenAccesoAdmin(accesos[i]) : null,
+      })),
+      marketplace: estadoMarketplace(),
+    }
   })
 
   const subcuentaExiste = async (locationId) => {
     const { rows } = await q('SELECT 1 FROM connections WHERE location_id=$1', [locationId])
     return rows.length > 0
   }
+
+  // Olvida la cache y vuelve a preguntar al marketplace por una subcuenta (tras dar o quitar un
+  // acceso a mano, sin esperar los 5 minutos). Es la única llamada en vivo que dispara la agencia,
+  // así que va limitada por admin: 60 por minuto, muy por debajo del límite del marketplace.
+  const RECOMPROBAR_MAX_MIN = 60
+  app.post('/api/admin/subcuentas/:locationId/acceso/recomprobar', guard, async (req, reply) => {
+    const locationId = texto(req.params.locationId)
+    if (!locationId || !(await subcuentaExiste(locationId))) {
+      return reply.code(404).send({ error: 'Subcuenta no encontrada' })
+    }
+    const quien = texto(req.sesion?.email || req.sesion?.usuario) || req.ip
+    const limite = await rateLimit(`admin:md:recomprobar:${quien}`, RECOMPROBAR_MAX_MIN, 60)
+    if (!limite.ok) {
+      return reply.code(429).send({ error: 'Demasiadas recomprobaciones seguidas. Espera un minuto.' })
+    }
+    await invalidarAcceso(locationId)
+    const acceso = resumenAccesoAdmin(await tieneAcceso(locationId, { log: req.log }))
+    return { ok: true, location_id: locationId, acceso }
+  })
 
   // ---------------------------------------------------------------------------
   // Proveedores de la agencia (owner_scope='admin', sin location_id)
@@ -1048,6 +1087,8 @@ export default async function adminRoutes(app) {
       },
       // mismos datos (puertos PÚBLICOS y estado TLS) que ve la subcuenta en GET /api/loc/relay
       relay,
+      // integración con el Marketplace Disruptivo (suscripción): estado sin la clave
+      marketplace: estadoMarketplace(),
     }
   }
 

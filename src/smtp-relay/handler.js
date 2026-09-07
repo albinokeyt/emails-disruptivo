@@ -238,6 +238,7 @@ async function procesar({ crudo, session, log }) {
     cuenta,
     from: mail.from?.value?.[0]?.address,
     nombre: mail.from?.value?.[0]?.name,
+    log,
   })
   if (!ruta.ok) throw errorSmtp(ruta.codigo, ruta.mensaje)
 

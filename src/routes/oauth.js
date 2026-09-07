@@ -10,6 +10,7 @@ import {
   fetchLocationName,
 } from '../lib/ghl.js'
 import { iniciarSesionSso, sesionActual } from '../lib/session.js'
+import { resumenAcceso, tieneAcceso } from '../lib/marketplace.js'
 
 // SPEC §5.1 — Instalación de la app en la subcuenta y sesión del panel.
 //   GET  /api/oauth/instalar   → chooselocation con state anti-CSRF de un solo uso
@@ -198,6 +199,12 @@ export default async function oauthRoutes(app) {
   // Sesión del panel
   // ---------------------------------------------------------------------------
 
+  // Suscripción de la subcuenta en el Marketplace Disruptivo (lib/marketplace.js). Es el primer
+  // punto de corte: el panel lee `acceso.activo` y, si es false, enseña `acceso.mensaje` en vez
+  // del panel. Las sesiones de admin no tienen subcuenta y no se comprueban (acceso = null).
+  const accesoDe = async (req, locationId) =>
+    locationId ? resumenAcceso(await tieneAcceso(locationId, { log: req.log })) : null
+
   // El iframe de GHL manda aquí el payload cifrado que recibe por postMessage. Es la ÚNICA
   // fuente del location_id de la sesión: nunca se lee de la query string, que sí es falsificable.
   app.post('/api/sesion/sso', async (req, reply) => {
@@ -227,6 +234,7 @@ export default async function oauthRoutes(app) {
         locationId: sesion.locationId,
         nombre: sesion.nombre,
         esAdminAgencia: Boolean(sesion.esAdminAgencia),
+        acceso: await accesoDe(req, sesion.locationId),
       }
     } catch (err) {
       const estado = Number(err.status || err.statusCode) || 500
@@ -238,6 +246,10 @@ export default async function oauthRoutes(app) {
   app.get('/api/sesion', async (req, reply) => {
     const sesion = await sesionActual(req)
     if (!sesion) return reply.code(401).send({ error: 'No hay ninguna sesión iniciada' })
-    return { ambito: sesion.locationId ? 'location' : 'admin', ...sesion }
+    return {
+      ambito: sesion.locationId ? 'location' : 'admin',
+      ...sesion,
+      acceso: await accesoDe(req, sesion.locationId),
+    }
   })
 }

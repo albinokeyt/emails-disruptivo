@@ -595,6 +595,53 @@ export default function Ajustes() {
       </div>
 
       <TarjetaRelay />
+
+      <TarjetaMarketplace datos={ajustes?.marketplace} />
+    </div>
+  )
+}
+
+// Suscripción en el Marketplace Disruptivo (GET /api/admin/ajustes → marketplace). Todo se
+// configura por variables de entorno; aquí solo se enseña el estado, nunca la clave.
+function TarjetaMarketplace({ datos }) {
+  if (!datos) return null
+  return (
+    <div className={`${TARJETA} space-y-3`}>
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <div className="text-sm font-semibold">Marketplace Disruptivo</div>
+          <p className="text-[11px] text-mut mt-0.5">
+            Emails Disruptivo se vende por suscripción. Antes de abrir el panel de una subcuenta y antes de aceptar cada
+            envío se consulta su acceso en el marketplace; los accesos se dan y se quitan allí.
+          </p>
+        </div>
+        <Badge
+          estado={datos.configurado ? 'activo' : 'pendiente'}
+          texto={datos.configurado ? 'Comprobando accesos' : 'Sin clave'}
+        />
+      </div>
+
+      {!datos.configurado && (
+        <Aviso variant="warn">
+          <code className="text-ink">MD_API_KEY</code> no está definida: no se corta a ninguna subcuenta. Defínela en las
+          variables de entorno del servicio para activar el corte por suscripción.
+        </Aviso>
+      )}
+
+      <div className="grid sm:grid-cols-3 gap-3 text-sm">
+        <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5">
+          <div className="text-[11px] text-mut uppercase tracking-wide mb-1">Marketplace</div>
+          <div className="text-ink font-mono text-xs break-all">{datos.base_url || '—'}</div>
+        </div>
+        <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5">
+          <div className="text-[11px] text-mut uppercase tracking-wide mb-1">Cache por subcuenta</div>
+          <div className="text-ink">{datos.cache_seg ?? '—'} s</div>
+        </div>
+        <div className="bg-card2 border border-border rounded-xl px-3.5 py-2.5">
+          <div className="text-[11px] text-mut uppercase tracking-wide mb-1">Gracia si no responde</div>
+          <div className="text-ink">{datos.gracia_horas ?? '—'} h</div>
+        </div>
+      </div>
     </div>
   )
 }

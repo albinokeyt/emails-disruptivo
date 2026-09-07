@@ -748,3 +748,59 @@ Credenciales IMAP cifradas como las de proveedores; nunca en logs. Tamaño máxi
 adjuntos se sirven con `Content-Type` real pero `X-Content-Type-Options: nosniff` y como descarga.
 El HTML se sanea en servidor antes de guardarlo. Las respuestas pasan por la lista de supresión y los
 límites de envío como cualquier otro correo.
+
+## 15. Suscripción: corte por acceso del Marketplace Disruptivo
+
+Emails Disruptivo se vende **por suscripción** desde el Marketplace Disruptivo. La app **no cobra
+nada**: solo pregunta al marketplace si la subcuenta tiene acceso y sirve o corta. Todo vive en
+`src/lib/marketplace.js`.
+
+### 15.1 Contrato de la API
+`GET {MD_BASE_URL}/api/v1/access/{locationId}` con cabecera exacta `Authorization: Bearer <MD_API_KEY>`.
+- Con acceso (200): `{"access":true,"via":"app"|"plan","plan"?,"status":"trial"|"active"|"comped",
+  "starts_at"?,"ends_at":ISO|null,"subscription_id"?,"credit":n}` (`ends_at` null = sin caducidad).
+- Sin acceso (200, **no** es error): `{"access":false,"credit":0}`.
+- 401 clave ausente/revocada · 403 subcuenta fuera del alcance de la clave · 429 límite (600/min,
+  `X-RateLimit-Remaining`) · 5xx caída. Se lee por nombre de campo y se toleran campos nuevos.
+- Solo decide **`access`**; el `status` no discrimina. Ninguna subcuenta va escrita en el código.
+
+### 15.2 Reglas de servicio
+- `tieneAcceso(locationId)` devuelve `{ access, via, plan, status, starts_at, ends_at,
+  subscription_id, credit, fuente, comprobado_en, motivo }` y **nunca lanza**.
+- Cache por subcuenta `MD_CACHE_SEG` (300 s, tope) en Redis `md:acceso:<locationId>` con respaldo en
+  memoria; las llamadas simultáneas de una subcuenta se funden en una petición. El registro se
+  retiene 30 días (nunca menos de 2 × gracia): la frescura la gobierna `comprobado_en`, no el TTL,
+  y así una subcuenta sin actividad no pierde su último resultado bueno.
+- Si la llamada falla (red, timeout, 429, 5xx; 401/403 se registran como error de configuración) se
+  sigue con el **último resultado bueno** (sea `access:true` o `false`) hasta `MD_GRACIA_HORAS`
+  (24 h) contadas desde el **primer fallo consecutivo** (`fallo_desde`, que cada éxito reinicia):
+  «24 h sin poder comprobar». Pasadas, se corta (`fuente: sin_comprobar`) y se registra el motivo.
+  Nunca se corta por un fallo reciente, tampoco a una subcuenta que llevaba días sin actividad; una
+  que nunca llegó a comprobarse recibe acceso `provisional` durante esa misma gracia.
+  Tras un fallo no se insiste durante 30 s (o el `Retry-After` de un 429).
+- `tieneAcceso(locationId, { soloCache: true })` responde solo con lo guardado, sin ir a la red
+  (`fuente: sin_datos`, `access: null` si no hay registro). Es para listados, nunca para un corte.
+- Sin `MD_API_KEY`: `access:true`, `fuente: sin_clave`, aviso en el log al arrancar; nadie se queda
+  sin servicio por un despliegue sin la variable.
+- La clave jamás se registra ni se devuelve (los mensajes de error se filtran por si la arrastran).
+
+### 15.3 Puntos de corte y textos
+- **Al abrir el panel**: `POST /api/sesion/sso` y `GET /api/sesion` devuelven `acceso:
+  { activo, mensaje, aviso, vence_el, plan, estado, via, fuente }` (null en sesiones de admin).
+  Con `activo:false` `App.jsx` no pinta el panel: solo el mensaje.
+- **Antes de aceptar un envío**: nodos de GHL (`400 {ok:false,error}`), relay SMTP (`451`, en ASCII
+  por RFC 5321) y responder/reenviar desde el buzón (`403 {error}`).
+- Texto literal para el usuario, sin códigos ni detalles técnicos:
+  «Tu suscripción a Emails Disruptivo no está activa. Habla con el Departamento Disruptivo para reactivarla.»
+- Si `ends_at` existe y faltan menos de 7 días: aviso discreto «Tu plan vence el {fecha}» en el
+  panel (`acceso.aviso`), sin bloquear. Con `ends_at` ya pasado y `access:true` (comped, gracia del
+  propio marketplace) no hay aviso: el corte depende solo de `access`.
+- Agencia: `GET /api/admin/subcuentas` añade `acceso` (con `motivo`; `null` en las desinstaladas)
+  leído con `soloCache` (ninguna llamada al marketplace por listar) y `marketplace`;
+  `POST /api/admin/subcuentas/:locationId/acceso/recomprobar` salta la cache y es la única llamada
+  en vivo de la agencia (60/min por admin, `429` si se pasa); `GET /api/admin/ajustes` devuelve
+  `marketplace: { configurado, base_url, cache_seg, gracia_horas, timeout_ms }`.
+
+### 15.4 Variables
+`MD_API_KEY` · `MD_BASE_URL` (def. `https://marketplace.escaladoacelerado.es`) · `MD_CACHE_SEG`
+(def. 300, máx. 300) · `MD_GRACIA_HORAS` (def. 24) · `MD_TIMEOUT_MS` (def. 5000).

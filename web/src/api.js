@@ -246,6 +246,10 @@ export const adminActivarRelay = (locationId) =>
 // Buzón (SPEC §14.3, admin): uso y cuota de todas las subcuentas, y cuota por subcuenta
 // (`quota_mb` null = volver al valor por defecto de Ajustes → límites → buzon_quota_mb).
 export const adminEspacioBuzon = () => api.get('/api/admin/buzon/espacio')
+
+// Suscripción en el Marketplace Disruptivo: olvida la cache y vuelve a preguntar por una subcuenta.
+export const adminRecomprobarAcceso = (locationId) =>
+  api.post(`/api/admin/subcuentas/${encodeURIComponent(locationId)}/acceso/recomprobar`)
 export const adminCuotaBuzon = (locationId, quotaMb) =>
   api.patch(`/api/admin/subcuentas/${encodeURIComponent(locationId)}/buzon`, { quota_mb: quotaMb })
 
