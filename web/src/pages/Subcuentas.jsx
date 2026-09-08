@@ -79,31 +79,35 @@ function CeldaBuzon({ s, uso, onEditar }) {
 }
 
 // Suscripción en el Marketplace Disruptivo (GET /api/admin/subcuentas → acceso: { activo, fuente,
-// vence_el, plan, estado, motivo, comprobado_en }). El listado se pinta desde lo guardado (cache de
-// 5 min, sin ir al marketplace); `fuente` dice de dónde sale el veredicto: api/cache (último
-// resultado bueno), gracia/provisional (el marketplace no responde y se mantiene el último
-// resultado), sin_comprobar (gracia agotada: cortada), sin_datos (todavía no se ha comprobado:
-// «Recomprobar» pregunta en vivo), sin_clave (MD_API_KEY sin definir). null = desinstalada.
+// vence_el, plan, estado, gracia, razon, mensaje_detalle, motivo, comprobado_en }). El listado se
+// pinta desde lo guardado (cache de 5 min, sin ir al marketplace); `fuente` dice de dónde sale el
+// veredicto: api/cache (último resultado bueno), gracia/provisional (el marketplace no responde y
+// se mantiene el último resultado), sin_comprobar (gracia agotada: cortada), sin_datos (todavía no
+// se ha comprobado: «Recomprobar» pregunta en vivo), sin_clave (MD_API_KEY sin definir).
+// `gracia` es otra cosa: la del MARKETPLACE por renovación fallida (sigue activa hasta vence_el).
+// null = desinstalada.
 function estadoAcceso(a) {
   if (!a) return { estado: 'desconocido', texto: '—' }
   if (a.fuente === 'sin_clave') return { estado: 'desconocido', texto: 'Sin clave' }
   if (a.fuente === 'sin_datos') return { estado: 'desconocido', texto: 'Sin datos' }
   if (!a.activo) return { estado: 'error', texto: a.fuente === 'sin_comprobar' ? 'Sin comprobar' : 'Sin acceso' }
-  if (a.fuente === 'gracia' || a.fuente === 'provisional') return { estado: 'pendiente', texto: 'Activa (gracia)' }
+  if (a.gracia) return { estado: 'pendiente', texto: 'En gracia', titulo: 'Renovación fallida: el marketplace mantiene el acceso hasta el fin de la gracia' }
+  if (a.fuente === 'gracia' || a.fuente === 'provisional') return { estado: 'pendiente', texto: 'Activa (sin comprobar)', titulo: 'El marketplace no responde: se mantiene el último resultado conocido' }
   return { estado: 'activo', texto: 'Activa' }
 }
 
 function CeldaAcceso({ acceso, ocupado, onRecomprobar }) {
-  const { estado, texto } = estadoAcceso(acceso)
+  const { estado, texto, titulo } = estadoAcceso(acceso)
+  // con acceso: plan y estado del marketplace; sin acceso: la segunda línea por `razon` y el fallo técnico
   const detalle = acceso?.activo
     ? [acceso.plan, acceso.estado].filter(Boolean).join(' · ')
-    : acceso?.motivo || ''
-  // ends_at ya pasado con acceso activo (comped, gracia del marketplace): informativo, no vence nada
+    : [acceso?.mensaje_detalle, acceso?.motivo].filter(Boolean).join(' · ')
+  // ends_at ya pasado con acceso activo (comped): informativo, no vence nada
   const vencido = acceso?.vence_el && new Date(acceso.vence_el).getTime() < Date.now()
   return (
     <div className="min-w-36">
       <div className="flex items-center gap-2 whitespace-nowrap">
-        <Badge estado={estado} texto={texto} titulo={acceso?.motivo || undefined} />
+        <Badge estado={estado} texto={texto} titulo={acceso?.motivo || titulo || undefined} />
         {acceso && acceso.fuente !== 'sin_clave' && (
           <button
             type="button"
@@ -117,8 +121,8 @@ function CeldaAcceso({ acceso, ocupado, onRecomprobar }) {
         )}
       </div>
       {acceso?.activo && acceso.vence_el && (
-        <div className="text-[11px] text-mut mt-0.5 whitespace-nowrap">
-          {vencido ? 'Venció el' : 'Vence el'} {fecha(acceso.vence_el)}
+        <div className={`text-[11px] mt-0.5 whitespace-nowrap ${acceso.gracia ? 'text-warn' : 'text-mut'}`}>
+          {acceso.gracia ? 'Gracia hasta el' : vencido ? 'Venció el' : 'Vence el'} {fecha(acceso.vence_el)}
         </div>
       )}
       {detalle && <div className="text-[11px] text-mut mt-0.5 truncate max-w-56" title={detalle}>{detalle}</div>}
@@ -354,10 +358,11 @@ export default function Subcuentas() {
           </li>
           <li>Activarles el relay SMTP y entregarles tú mismo las credenciales.</li>
           <li>
-            Ver si su suscripción en el Marketplace Disruptivo está activa (columna «Suscripción»). Los accesos se dan
-            y se quitan en el marketplace; aquí se pinta lo último que se comprobó (cache de 5 minutos, que cada
-            subcuenta refresca al abrir su panel o enviar). «Sin datos» = aún no se ha comprobado; «Recomprobar»
-            pregunta al marketplace en el acto.
+            Ver si su suscripción en el Marketplace Disruptivo está activa (columna «Suscripción», con el plan debajo).
+            Los accesos se dan y se quitan en el marketplace; aquí se pinta lo último que se comprobó (cache de 5
+            minutos, que cada subcuenta refresca al abrir su panel o enviar). «En gracia» = la renovación falló y el
+            marketplace mantiene el acceso unos días hasta la fecha indicada (la subcuenta ve un aviso para recargar
+            saldo). «Sin datos» = aún no se ha comprobado; «Recomprobar» pregunta al marketplace en el acto.
           </li>
           <li>
             Ajustar la cuota del buzón de cada una (columna «Buzón»). El valor por defecto para todas se cambia en{' '}

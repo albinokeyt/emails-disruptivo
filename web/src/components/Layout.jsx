@@ -1,10 +1,39 @@
 import { useEffect, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
-  AtSign, Building2, CalendarClock, FileText, Globe, Inbox, LayoutDashboard, LogOut, Mail, MailX, Menu,
-  Send, Server, Settings, Share2, ShieldCheck, Users, X,
+  AlertTriangle, AtSign, Building2, CalendarClock, FileText, Globe, Inbox, LayoutDashboard, LogOut, Mail, MailX,
+  Menu, Send, Server, Settings, Share2, ShieldCheck, Users, X,
 } from 'lucide-react'
 import { contarNoLeidosBuzon } from '../api.js'
+
+// Fechas del acceso (vence_el) tal y como las lee el cliente: «7 de marzo de 2027»
+const fechaLarga = (v) => {
+  const d = v ? new Date(v) : null
+  return d && Number.isFinite(d.getTime())
+    ? d.toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Madrid' })
+    : null
+}
+
+// Aviso de gracia del marketplace (GET /api/sesion → acceso.aviso_gracia): la renovación falló y
+// el acceso se mantiene hasta vence_el (fin de la gracia). Texto fijado por el contrato.
+const textoGracia = (acceso) => {
+  const fecha = fechaLarga(acceso?.vence_el)
+  return fecha
+    ? `Tu suscripción está en periodo de gracia hasta el ${fecha}: recarga tu saldo en el marketplace para no perder el acceso`
+    : 'Tu suscripción está en periodo de gracia: recarga tu saldo en el marketplace para no perder el acceso'
+}
+
+// «Plan: Emails Disruptivo · Pro · prueba hasta 7 de marzo de 2027», discreto, en el pie del menú
+const textoPlan = (acceso) => {
+  if (!acceso?.plan) return null
+  const fecha = fechaLarga(acceso.vence_el)
+  const sufijo = acceso.gracia
+    ? fecha ? `en gracia hasta ${fecha}` : 'en gracia'
+    : acceso.estado === 'trial'
+      ? fecha ? `prueba hasta ${fecha}` : 'prueba'
+      : fecha ? `hasta ${fecha}` : ''
+  return `Plan: ${acceso.plan}${sufijo ? ` · ${sufijo}` : ''}`
+}
 
 // La navegación es distinta según quién mira: la subcuenta gestiona lo suyo,
 // la agencia gestiona el parque entero.
@@ -118,6 +147,7 @@ function Enlaces({ items, contadores = {}, onNavegar }) {
 }
 
 function PieSubcuenta({ sesion }) {
+  const plan = textoPlan(sesion?.acceso)
   return (
     <div className="m-3 rounded-xl border border-border bg-card2/60 px-3 py-2.5">
       <div className="text-[11px] text-mut">Subcuenta</div>
@@ -125,6 +155,11 @@ function PieSubcuenta({ sesion }) {
         {sesion?.nombre || 'Sin nombre'}
       </div>
       <code className="block text-[10px] text-mut truncate">{sesion?.locationId}</code>
+      {plan && (
+        <div className={`mt-1 text-[10px] truncate ${sesion.acceso.gracia ? 'text-warn' : 'text-mut'}`} title={plan}>
+          {plan}
+        </div>
+      )}
       {sesion?.esAdminAgencia && (
         <a
           href="/admin"
@@ -217,6 +252,17 @@ export default function Layout({ ambito = 'location', sesion = null, onSalir, ch
           </header>
 
           <main className="flex-1 min-w-0 p-5 lg:p-8 overflow-x-hidden">
+            {/* Gracia del marketplace (acceso.aviso_gracia): renovación fallida, el acceso sigue hasta vence_el.
+                Ámbar y más visible que el de vencimiento porque aquí hay algo que hacer (recargar saldo). */}
+            {!esAdmin && sesion?.acceso?.aviso_gracia && (
+              <div
+                className="mb-4 flex items-center gap-2 rounded-xl border border-warn/40 bg-warn/10 px-3.5 py-2.5 text-sm text-ink"
+                role="alert"
+              >
+                <AlertTriangle size={16} className="text-warn shrink-0" />
+                <span>{textoGracia(sesion.acceso)}</span>
+              </div>
+            )}
             {/* Aviso discreto de vencimiento de la suscripción (GET /api/sesion → acceso.aviso): no bloquea nada */}
             {!esAdmin && sesion?.acceso?.aviso && (
               <div className="mb-4 flex items-center gap-2 rounded-xl border border-warn/25 bg-warn/5 px-3.5 py-2 text-xs text-ink2">

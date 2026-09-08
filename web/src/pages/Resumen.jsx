@@ -153,11 +153,13 @@ export default function Resumen() {
       {dias.length > 0 && maxDia > 0 && (
         <div className={TARJETA}>
           <div className="text-sm font-semibold mb-4">Envíos por día</div>
-          <div className="flex items-end gap-2 h-32">
+          {/* sin items-end en la fila: las columnas deben estirarse a los 128 px para que la
+              altura en % de cada barra tenga contra qué resolverse (si no, mide 0) */}
+          <div className="flex gap-2 h-32">
             {dias.map((d) => {
               const v = Number(d.total) || 0
               return (
-                <div key={d.fecha ?? d.dia} className="flex-1 flex flex-col items-center gap-2">
+                <div key={d.fecha ?? d.dia} className="flex-1 h-full flex flex-col items-center gap-2">
                   <div className="w-full flex-1 flex items-end">
                     <div
                       className="w-full bg-gold/70 rounded-t"

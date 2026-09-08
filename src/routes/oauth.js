@@ -200,8 +200,12 @@ export default async function oauthRoutes(app) {
   // ---------------------------------------------------------------------------
 
   // Suscripción de la subcuenta en el Marketplace Disruptivo (lib/marketplace.js). Es el primer
-  // punto de corte: el panel lee `acceso.activo` y, si es false, enseña `acceso.mensaje` en vez
-  // del panel. Las sesiones de admin no tienen subcuenta y no se comprueban (acceso = null).
+  // punto de corte: el panel lee `acceso.activo` y, si es false, enseña `acceso.mensaje` (y debajo
+  // `acceso.mensaje_detalle`, la segunda línea que sale de `razon`: past_due | expired | canceled)
+  // en vez del panel. Con acceso, `acceso` trae además `plan`, `estado`, `vence_el`, `aviso`
+  // (vence en menos de 7 días) y `gracia`/`aviso_gracia` (renovación fallida: el marketplace
+  // mantiene el acceso hasta `vence_el` y el panel pide recargar saldo). Las sesiones de admin no
+  // tienen subcuenta y no se comprueban (acceso = null).
   const accesoDe = async (req, locationId) =>
     locationId ? resumenAcceso(await tieneAcceso(locationId, { log: req.log })) : null
 

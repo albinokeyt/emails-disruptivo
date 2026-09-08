@@ -755,18 +755,32 @@ Emails Disruptivo se vende **por suscripción** desde el Marketplace Disruptivo.
 nada**: solo pregunta al marketplace si la subcuenta tiene acceso y sirve o corta. Todo vive en
 `src/lib/marketplace.js`.
 
-### 15.1 Contrato de la API
+### 15.1 Contrato de la API (ampliado el 2026-09-08)
 `GET {MD_BASE_URL}/api/v1/access/{locationId}` con cabecera exacta `Authorization: Bearer <MD_API_KEY>`.
-- Con acceso (200): `{"access":true,"via":"app"|"plan","plan"?,"status":"trial"|"active"|"comped",
-  "starts_at"?,"ends_at":ISO|null,"subscription_id"?,"credit":n}` (`ends_at` null = sin caducidad).
-- Sin acceso (200, **no** es error): `{"access":false,"credit":0}`.
-- 401 clave ausente/revocada · 403 subcuenta fuera del alcance de la clave · 429 límite (600/min,
-  `X-RateLimit-Remaining`) · 5xx caída. Se lee por nombre de campo y se toleran campos nuevos.
-- Solo decide **`access`**; el `status` no discrimina. Ninguna subcuenta va escrita en el código.
+- Con acceso (200): `{"access":true,"via":"app"|"plan","plan":"Emails Disruptivo · Pro"|null,
+  "status":"trial"|"active"|"comped","grace":false|true,"starts_at"?,"ends_at":ISO|null,
+  "subscription_id":15,"credit":n}` (`ends_at` null = sin caducidad).
+- `grace:true` = la renovación falló y la suscripción está en el **periodo de gracia del
+  marketplace** (3 días por defecto, reintento cada 24 h); `ends_at` es entonces el **fin de la
+  gracia**. Sigue con acceso; la app solo avisa (15.3). Las pruebas (`trial`) que vencen no tienen
+  gracia: llegan como `access:false`.
+- Sin acceso (200, **no** es error): `{"access":false,"reason":"past_due"|"expired"|"canceled"|
+  "scheduled"|"none","credit":0}`.
+- 401 clave ausente/revocada · 403 subcuenta fuera del alcance de la clave, con cuerpo
+  `{"code":"LOCATION_NOT_ALLOWED"}` · 429 límite (600/min, `X-RateLimit-Remaining`) · 5xx caída.
+  Se lee por nombre de campo y se toleran campos nuevos.
+- Solo decide **`access`**; el `status` no discrimina. Se ramifica por `access`/`grace`/`reason`
+  y por `code`, **nunca por textos**. Ninguna subcuenta va escrita en el código.
 
 ### 15.2 Reglas de servicio
-- `tieneAcceso(locationId)` devuelve `{ access, via, plan, status, starts_at, ends_at,
-  subscription_id, credit, fuente, comprobado_en, motivo }` y **nunca lanza**.
+- `tieneAcceso(locationId)` devuelve `{ access, via, plan, status, grace, reason, starts_at,
+  ends_at, subscription_id, credit, fuente, comprobado_en, motivo }` y **nunca lanza**. `grace`
+  solo puede ser true con `access:true`; `reason` solo viene con `access:false` (registros
+  guardados antes del contrato ampliado se leen con `grace:false` y `reason:null`).
+- Un 403 con `code: LOCATION_NOT_ALLOWED` se registra aparte como **error de configuración del
+  alcance de la clave** (`[marketplace] alcance de la clave: la subcuenta no está entre las
+  permitidas para MD_API_KEY`, etiqueta `alcance`); el resto de 403 y los 401 siguen como
+  `configuracion`. La política no cambia: último resultado bueno durante la gracia de 24 h.
 - Cache por subcuenta `MD_CACHE_SEG` (300 s, tope) en Redis `md:acceso:<locationId>` con respaldo en
   memoria; las llamadas simultáneas de una subcuenta se funden en una petición. El registro se
   retiene 30 días (nunca menos de 2 × gracia): la frescura la gobierna `comprobado_en`, no el TTL,
@@ -786,17 +800,29 @@ nada**: solo pregunta al marketplace si la subcuenta tiene acceso y sirve o cort
 
 ### 15.3 Puntos de corte y textos
 - **Al abrir el panel**: `POST /api/sesion/sso` y `GET /api/sesion` devuelven `acceso:
-  { activo, mensaje, aviso, vence_el, plan, estado, via, fuente }` (null en sesiones de admin).
-  Con `activo:false` `App.jsx` no pinta el panel: solo el mensaje.
+  { activo, mensaje, mensaje_detalle, aviso, aviso_gracia, gracia, razon, vence_el, plan, estado,
+  via, suscripcion_id, fuente }` (null en sesiones de admin). Con `activo:false` `App.jsx` no pinta
+  el panel: solo el mensaje y, debajo, `mensaje_detalle` si existe.
 - **Antes de aceptar un envío**: nodos de GHL (`400 {ok:false,error}`), relay SMTP (`451`, en ASCII
-  por RFC 5321) y responder/reenviar desde el buzón (`403 {error}`).
-- Texto literal para el usuario, sin códigos ni detalles técnicos:
+  por RFC 5321) y responder/reenviar desde el buzón (`403 {error}`). Ahí solo va el texto literal.
+- Texto literal para el usuario, sin códigos ni detalles técnicos (**no cambia**):
   «Tu suscripción a Emails Disruptivo no está activa. Habla con el Departamento Disruptivo para reactivarla.»
+- Segunda línea (`mensaje_detalle`) según `reason`, solo en el panel: `past_due` → «Hay un pago
+  pendiente en el marketplace.»; `expired` → «La suscripción ha vencido.»; `canceled` → «La
+  suscripción fue cancelada.»; `scheduled`, `none` o sin `reason` → sin segunda línea.
+- Gracia del marketplace (`grace:true` → `acceso.gracia` y `acceso.aviso_gracia: true`,
+  `vence_el` = fin de la gracia): banner ámbar en el panel, sin bloquear: «Tu suscripción está en
+  periodo de gracia hasta el {fecha}: recarga tu saldo en el marketplace para no perder el acceso».
+  Mientras dura la gracia no se muestra el aviso de vencimiento (ese `ends_at` no es el del plan).
 - Si `ends_at` existe y faltan menos de 7 días: aviso discreto «Tu plan vence el {fecha}» en el
-  panel (`acceso.aviso`), sin bloquear. Con `ends_at` ya pasado y `access:true` (comped, gracia del
-  propio marketplace) no hay aviso: el corte depende solo de `access`.
-- Agencia: `GET /api/admin/subcuentas` añade `acceso` (con `motivo`; `null` en las desinstaladas)
-  leído con `soloCache` (ninguna llamada al marketplace por listar) y `marketplace`;
+  panel (`acceso.aviso`), sin bloquear. Con `ends_at` ya pasado y `access:true` (comped) no hay
+  aviso: el corte depende solo de `access`.
+- El pie del menú lateral enseña el plan de forma discreta: «Plan: {plan} · prueba hasta {fecha}»
+  (`status: trial`), «· en gracia hasta {fecha}» (`gracia`) o «· hasta {fecha}»; nada sin `plan`.
+- Agencia: `GET /api/admin/subcuentas` añade `acceso` (lo mismo que la sesión más `motivo`,
+  `comprobado_en` y `credito`; `null` en las desinstaladas) leído con `soloCache` (ninguna llamada
+  al marketplace por listar) y `marketplace`. La columna «Suscripción» pinta el plan debajo del
+  badge y «En gracia» (ámbar, con «Gracia hasta el {fecha}») cuando `gracia` es true;
   `POST /api/admin/subcuentas/:locationId/acceso/recomprobar` salta la cache y es la única llamada
   en vivo de la agencia (60/min por admin, `429` si se pasa); `GET /api/admin/ajustes` devuelve
   `marketplace: { configurado, base_url, cache_seg, gracia_horas, timeout_ms }`.

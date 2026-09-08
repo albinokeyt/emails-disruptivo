@@ -9,14 +9,22 @@ import { redis as redisGlobal } from '../redis.js'
 //
 //   GET {MD_BASE_URL}/api/v1/access/{locationId}     Authorization: Bearer <MD_API_KEY>
 //
-//   200 {"access":true, "via":"app"|"plan", "plan"?, "status":"trial"|"active"|"comped",
-//        "starts_at"?, "ends_at": ISO|null, "subscription_id"?, "credit": n}
-//   200 {"access":false, "credit":0}          ← sin acceso; NO es un error
-//   401 clave ausente o revocada · 403 subcuenta fuera del alcance de la clave · 429 límite
-//   (600/min, cabecera X-RateLimit-Remaining) · 5xx caída
+//   200 {"access":true, "via":"app"|"plan", "plan": "Emails Disruptivo · Pro"|null,
+//        "status":"trial"|"active"|"comped", "grace": false|true, "starts_at"?,
+//        "ends_at": ISO|null, "subscription_id"?, "credit": n}
+//   200 {"access":false, "reason": past_due|expired|canceled|scheduled|none, "credit":0}
+//        ← sin acceso; NO es un error
+//   401 clave ausente o revocada · 403 subcuenta fuera del alcance de la clave (cuerpo con
+//   "code":"LOCATION_NOT_ALLOWED") · 429 límite (600/min, cabecera X-RateLimit-Remaining) · 5xx caída
 //
 // Se lee por nombre de campo y se toleran campos nuevos. Solo decide `access`: el `status` no
 // discrimina (trial, active y comped valen igual). Ninguna subcuenta va escrita en el código.
+//   · grace:true = la renovación falló y la suscripción está en el periodo de gracia del propio
+//     marketplace (3 días, reintento cada 24 h); ends_at es el FIN de esa gracia. Sigue con acceso,
+//     pero hay que avisar en el panel para que recargue saldo (aviso_gracia).
+//   · reason solo viene con access:false y permite una segunda línea bajo el texto de bloqueo
+//     (mensaje_detalle). Se ramifica por access/grace/reason, nunca por textos.
+//   · Las pruebas (trial) que vencen no tienen gracia: llegan como access:false.
 //
 // Reglas de servicio (las de verdad importantes):
 //   · Cache por subcuenta de MD_CACHE_SEG (300 s, tope): el admin del marketplace da y quita
@@ -43,6 +51,16 @@ import { redis as redisGlobal } from '../redis.js'
 /** Texto LITERAL que ve el usuario cuando no hay suscripción. Sin códigos ni detalles técnicos. */
 export const MENSAJE_SIN_ACCESO =
   'Tu suscripción a Emails Disruptivo no está activa. Habla con el Departamento Disruptivo para reactivarla.'
+
+/** Segunda línea opcional bajo MENSAJE_SIN_ACCESO, elegida por `reason` (nunca por textos). */
+const DETALLE_SIN_ACCESO = Object.freeze({
+  past_due: 'Hay un pago pendiente en el marketplace.',
+  expired: 'La suscripción ha vencido.',
+  canceled: 'La suscripción fue cancelada.',
+})
+
+/** Código que trae el 403 cuando la subcuenta no está en el alcance de la clave. */
+const CODIGO_FUERA_DE_ALCANCE = 'LOCATION_NOT_ALLOWED'
 
 const PREFIJO_CLAVE = 'md:acceso:'
 const DIAS_AVISO_VENCIMIENTO = 7
@@ -73,6 +91,13 @@ function nombrePlan(v) {
   return null
 }
 
+// `reason` solo tiene sentido sin acceso; se guarda en minúsculas y con la grafía del contrato
+function motivoSinAcceso(v, access) {
+  if (access) return null
+  const r = texto(v).toLowerCase()
+  return r === 'cancelled' ? 'canceled' : r || null
+}
+
 /** Lee por nombre de campo la respuesta del marketplace. null si no trae un `access` booleano. */
 export function normalizarRespuestaAcceso(cuerpo) {
   if (!cuerpo || typeof cuerpo !== 'object' || typeof cuerpo.access !== 'boolean') return null
@@ -82,6 +107,9 @@ export function normalizarRespuestaAcceso(cuerpo) {
     via: texto(cuerpo.via) || null,
     plan: nombrePlan(cuerpo.plan),
     status: texto(cuerpo.status) || null,
+    // solo cuenta con acceso: un grace:true con access:false sería un contrato roto, no una gracia
+    grace: cuerpo.access && cuerpo.grace === true,
+    reason: motivoSinAcceso(cuerpo.reason, cuerpo.access),
     starts_at: fechaIso(cuerpo.starts_at),
     ends_at: fechaIso(cuerpo.ends_at),
     subscription_id: texto(cuerpo.subscription_id) || null,
@@ -90,7 +118,8 @@ export function normalizarRespuestaAcceso(cuerpo) {
 }
 
 const DATOS_VACIOS = {
-  via: null, plan: null, status: null, starts_at: null, ends_at: null, subscription_id: null, credit: 0,
+  via: null, plan: null, status: null, grace: false, reason: null, starts_at: null, ends_at: null,
+  subscription_id: null, credit: 0,
 }
 
 const formatoFecha = new Intl.DateTimeFormat('es-ES', {
@@ -99,12 +128,12 @@ const formatoFecha = new Intl.DateTimeFormat('es-ES', {
 
 /**
  * «Tu plan vence el {fecha}» cuando ends_at existe y FALTAN menos de 7 días. null en cualquier otro
- * caso: sin caducidad, lejos todavía, sin acceso (ahí manda MENSAJE_SIN_ACCESO) o ends_at ya
- * pasado con access:true (comped o gracia del propio marketplace: no hay nada que avisar, el corte
- * depende solo de access).
+ * caso: sin caducidad, lejos todavía, sin acceso (ahí manda MENSAJE_SIN_ACCESO), ends_at ya
+ * pasado con access:true (comped: no hay nada que avisar, el corte depende solo de access) o en
+ * periodo de gracia (ahí ends_at es el fin de la gracia y manda aviso_gracia, no este).
  */
 export function avisoVencimiento(acceso, ahora = Date.now()) {
-  if (!acceso || acceso.access !== true || !acceso.ends_at) return null
+  if (!acceso || acceso.access !== true || acceso.grace === true || !acceso.ends_at) return null
   const fin = new Date(acceso.ends_at).getTime()
   if (!Number.isFinite(fin)) return null
   const faltan = fin - ahora
@@ -112,20 +141,33 @@ export function avisoVencimiento(acceso, ahora = Date.now()) {
   return `Tu plan vence el ${formatoFecha.format(new Date(fin))}`
 }
 
+/** Segunda línea bajo el texto de bloqueo según `reason`; null si no hay nada que añadir. */
+export function detalleSinAcceso(acceso) {
+  if (!acceso || acceso.access !== false) return null
+  return DETALLE_SIN_ACCESO[acceso.reason] ?? null
+}
+
 /** Lo que ve la SUBCUENTA en su sesión: sin motivos técnicos. */
 export function resumenAcceso(acceso, ahora = Date.now()) {
   const activo = acceso?.access === true
   // access:null solo sale de soloCache sin registro (fuente sin_datos): no es un veredicto
   const conocido = typeof acceso?.access === 'boolean'
+  const gracia = activo && acceso.grace === true
   return {
     activo,
     fuente: acceso?.fuente ?? null,
     mensaje: activo || !conocido ? null : MENSAJE_SIN_ACCESO,
+    mensaje_detalle: activo || !conocido ? null : detalleSinAcceso(acceso),
     aviso: activo ? avisoVencimiento(acceso, ahora) : null,
+    // renovación fallida: sigue con acceso hasta vence_el (fin de la gracia) y el panel avisa
+    aviso_gracia: gracia,
+    gracia,
+    razon: conocido && !activo ? acceso.reason ?? null : null,
     vence_el: acceso?.ends_at ?? null,
     plan: acceso?.plan ?? null,
     estado: acceso?.status ?? null,
     via: acceso?.via ?? null,
+    suscripcion_id: acceso?.subscription_id ?? null,
   }
 }
 
@@ -232,12 +274,22 @@ export function crearClienteMarketplace({
     return Math.min(REINTENTO_MAXIMO_MS, Math.max(REINTENTO_TRAS_FALLO_MS, s * 1000))
   }
 
-  /** { ok:true, datos, cuota } | { ok:false, motivo, configuracion, status, reintentoMs } */
+  // Del cuerpo de un error solo interesa `code` (corto y sin secretos); si no es JSON, nada
+  async function codigoDeError(res) {
+    try {
+      const cuerpo = await res.json()
+      return texto(cuerpo?.code).toUpperCase() || null
+    } catch {
+      return null
+    }
+  }
+
+  /** { ok:true, datos, cuota } | { ok:false, motivo, configuracion, alcance, status, reintentoMs } */
   async function llamarApi(locationId) {
     const controlador = new AbortController()
     const temporizador = setTimeout(() => controlador.abort(), cfg.timeoutMs)
     const fallo = (motivo, extra = {}) => ({
-      ok: false, motivo, configuracion: false, status: null, reintentoMs: REINTENTO_TRAS_FALLO_MS, ...extra,
+      ok: false, motivo, configuracion: false, alcance: false, status: null, reintentoMs: REINTENTO_TRAS_FALLO_MS, ...extra,
     })
     try {
       const res = await pedir(`${cfg.baseUrl}/api/v1/access/${encodeURIComponent(locationId)}`, {
@@ -265,7 +317,17 @@ export function crearClienteMarketplace({
         return fallo('la clave de la API del marketplace (MD_API_KEY) falta o está revocada (401)', { status, configuracion: true })
       }
       if (status === 403) {
-        return fallo('la subcuenta está fuera del alcance de la clave de la API del marketplace (403)', { status, configuracion: true })
+        // se distingue por `code`, no por el texto del cuerpo: LOCATION_NOT_ALLOWED es un error de
+        // configuración del ALCANCE de la clave (la subcuenta no está en su lista); la política de
+        // gracia de 24 h es la misma que para cualquier otro fallo
+        const codigo = await codigoDeError(res)
+        if (codigo === CODIGO_FUERA_DE_ALCANCE) {
+          return fallo(
+            `la subcuenta está fuera del alcance de la clave de la API del marketplace (403 ${CODIGO_FUERA_DE_ALCANCE})`,
+            { status, configuracion: true, alcance: true }
+          )
+        }
+        return fallo(`la clave de la API del marketplace no tiene permiso para esta subcuenta (403${codigo ? ` ${codigo}` : ''})`, { status, configuracion: true })
       }
       if (status === 429) {
         return fallo('límite de peticiones del marketplace alcanzado (429)', { status, reintentoMs: retryAfterMs(res) })
@@ -291,6 +353,9 @@ export function crearClienteMarketplace({
     via: registro.via ?? null,
     plan: registro.plan ?? null,
     status: registro.status ?? null,
+    // registros guardados antes del contrato ampliado no traen estos campos: valen los neutros
+    grace: registro.access === true && registro.grace === true,
+    reason: registro.access === false ? registro.reason ?? null : null,
     starts_at: registro.starts_at ?? null,
     ends_at: registro.ends_at ?? null,
     subscription_id: registro.subscription_id ?? null,
@@ -342,7 +407,7 @@ export function crearClienteMarketplace({
     }
 
     // Fallo. Se anota el intento para no insistir durante REINTENTO_TRAS_FALLO_MS y se conserva
-    // TODO lo demás del registro (el último resultado bueno es justo lo que hay que proteger).
+    // todo lo demás del registro (el último resultado bueno es justo lo que hay que proteger).
     const base = guardado ?? { ...DATOS_VACIOS, access: true, comprobado_en: null, provisional: true }
     const registro = {
       ...base,
@@ -354,7 +419,10 @@ export function crearClienteMarketplace({
     await guardar(locationId, registro, log)
 
     const datos = { locationId, motivo: resultado.motivo, http: resultado.status ?? undefined }
-    if (resultado.configuracion) {
+    if (resultado.alcance) {
+      registrar(log, 'error', 'alcance', { ...datos, code: CODIGO_FUERA_DE_ALCANCE },
+        'marketplace: alcance de la clave: la subcuenta no está entre las permitidas para MD_API_KEY; añádela en el marketplace. Se mantiene el último resultado conocido')
+    } else if (resultado.configuracion) {
       registrar(log, 'error', 'configuracion', datos,
         'marketplace: error de configuración al comprobar la suscripción; se mantiene el último resultado conocido')
     } else {
@@ -368,10 +436,13 @@ export function crearClienteMarketplace({
 
   /**
    * ¿Tiene acceso esta subcuenta? Devuelve siempre un objeto y nunca lanza:
-   *   { access, via, plan, status, starts_at, ends_at, subscription_id, credit,
+   *   { access, via, plan, status, grace, reason, starts_at, ends_at, subscription_id, credit,
    *     fuente: 'api'|'cache'|'gracia'|'provisional'|'sin_comprobar'|'sin_clave'|'sin_subcuenta'|'error_interno'
    *             |'sin_datos',
    *     comprobado_en: ISO|null, motivo: string|null }
+   * `grace` (solo con access:true) es la gracia del MARKETPLACE por renovación fallida; no confundir
+   * con fuente:'gracia', que es la de esta app cuando el marketplace no responde. `reason` solo
+   * viene con access:false (past_due | expired | canceled | scheduled | none).
    *
    * `soloCache: true` (listados): responde con lo guardado en Redis/memoria y NO va a la red. Si no
    * hay registro devuelve access:null con fuente 'sin_datos' («sin datos», no «sin acceso»). Es solo

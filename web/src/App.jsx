@@ -104,9 +104,16 @@ function PanelSubcuenta() {
   }
 
   // Suscripción en el Marketplace Disruptivo: el backend lo decide (GET /api/sesion → acceso).
-  // Sin acceso no se pinta el panel, solo el mensaje literal del encargo.
+  // Sin acceso no se pinta el panel, solo el mensaje literal del encargo y, si el marketplace dio
+  // un motivo (razon: past_due | expired | canceled), la segunda línea ya redactada (mensaje_detalle).
   if (sesion.acceso && sesion.acceso.activo === false) {
-    return <PantallaSinAcceso mensaje={sesion.acceso.mensaje} onReintentar={arrancar} />
+    return (
+      <PantallaSinAcceso
+        mensaje={sesion.acceso.mensaje}
+        detalle={sesion.acceso.mensaje_detalle}
+        onReintentar={arrancar}
+      />
+    )
   }
 
   return (
@@ -228,7 +235,7 @@ function PantallaCarga({ texto }) {
   )
 }
 
-function PantallaSinAcceso({ mensaje, onReintentar }) {
+function PantallaSinAcceso({ mensaje, detalle, onReintentar }) {
   return (
     <div className="min-h-screen grid place-items-center relative p-6">
       <div className="app-bg" aria-hidden="true" />
@@ -241,6 +248,7 @@ function PantallaSinAcceso({ mensaje, onReintentar }) {
         </div>
         <Aviso tipo="aviso">
           {mensaje || 'Tu suscripción a Emails Disruptivo no está activa. Habla con el Departamento Disruptivo para reactivarla.'}
+          {detalle && <span className="block mt-1 text-ink">{detalle}</span>}
         </Aviso>
         <div className="flex gap-2 pt-1">
           <Boton icono={RefreshCw} onClick={onReintentar}>Volver a comprobar</Boton>
