@@ -4,12 +4,13 @@ import { pool, q } from '../db.js'
 import { requireLocation } from '../lib/auth.js'
 import { cifrarCredenciales, randomCorrelationId } from '../lib/crypto.js'
 import { RE_HOST, destinoPermitido, hostPublico } from '../lib/red.js'
-import { consumirLimiteEnvio, rateLimit } from '../lib/ratelimit.js'
-import { filtrarSuprimidos } from '../lib/suppression.js'
+import { rateLimit } from '../lib/ratelimit.js'
 import { escaparHtml, textoDesdeHtml } from '../lib/render.js'
 import { borrarMensajeBuzon, cuotaDe, recalcularUso, tamanoLegible } from '../lib/buzon.js'
 import { borrarEnServidor, probarBuzon, sincronizarBuzon } from '../lib/buzon-sync.js'
-import { MENSAJE_SIN_ACCESO, tieneAcceso } from '../lib/marketplace.js'
+// Puertas previas al encolado (suscripción, supresión, límite) y proveedor del remitente: se
+// comparten con «Enviar prueba» de Remitentes (src/lib/envio-prueba.js).
+import { comprobarEncolado, fallo, proveedorDe, registrarCopiasSuprimidas } from '../lib/encolar.js'
 // Las mismas utilidades de validación que el resto del panel de subcuenta (y que reutiliza admin.js).
 import { cabecera, esEmail, idDe, paginar, texto } from './location.js'
 
@@ -38,8 +39,6 @@ const MAX_HILO = 100
 const MAX_REFERENCIAS = 30
 const MAX_ID_MENSAJE = 998
 const MAX_SNIPPET = 160
-const RANGO_ENCOLADO = 0
-const RANGO_SUPRIMIDO = 93 // §4 del SPEC: 'suprimido' es terminal
 // Pasada forzada desde el panel (corre dentro de la petición HTTP): mensajes y tiempo de importación
 // acotados, y plazo tras el cual se responde «en curso» y la pasada sigue en segundo plano.
 const MAX_MENSAJES_FORZADA = 50
@@ -64,12 +63,6 @@ const CARPETAS = new Set(['bandeja', 'no_leidos', 'enviados'])
 const ZONA_HORARIA = texto(process.env.TZ) || 'Europe/Madrid'
 
 const malo = (reply, mensaje) => reply.code(400).send({ error: mensaje })
-
-function fallo(codigo, mensaje) {
-  const err = new Error(mensaje)
-  err.codigo = codigo
-  return err
-}
 
 // true/false, 'true'/'false', 1/0, 'si'/'no'; null si no se entiende
 function booleano(v, def) {
@@ -543,22 +536,9 @@ async function resolverRemitente(locationId, senderIdBody, replySenderId) {
   return porDefecto
 }
 
-/** Proveedor del remitente, comprobando que siga disponible para la subcuenta (propio o cedido). */
-async function proveedorDe(remitente, locationId) {
-  if (!remitente.provider_id) {
-    throw fallo(400, `El remitente ${remitente.email} no tiene proveedor asignado: asígnale uno en Remitentes antes de responder`)
-  }
-  const { rows: [p] } = await q(
-    `SELECT p.id FROM providers p
-      WHERE p.id = $1 AND (
-            (p.owner_scope = 'location' AND p.location_id = $2)
-         OR (p.owner_scope = 'admin' AND EXISTS (
-               SELECT 1 FROM provider_assignments a WHERE a.provider_id = p.id AND a.location_id = $2)))`,
-    [remitente.provider_id, locationId]
-  )
-  if (!p) throw fallo(400, `El proveedor del remitente ${remitente.email} ya no está disponible para tu subcuenta`)
-  return p
-}
+// El proveedor del remitente (propio o cedido, 400 si ya no está disponible) lo resuelve
+// proveedorDe() de src/lib/encolar.js; aquí solo se fija el texto del aviso.
+const proveedorParaResponder = (remitente, locationId) => proveedorDe(remitente, locationId, { accion: 'responder' })
 
 // Reply-To de lo que sale del buzón: la propia cuenta IMAP, para que la contestación vuelva a
 // entrar por aquí aunque el remitente sea otra dirección (p. ej. se responde por Brevo desde
@@ -582,31 +562,13 @@ async function encolarDesdeBuzon({
   locationId, log, original = null, cuentaEmail = original?.cuenta_email, remitente, proveedor,
   destino, nombreDestino, cc, bcc, asunto, html, text,
 }) {
-  // Suscripción en el Marketplace Disruptivo: responder, reenviar o redactar desde el buzón también
-  // es un envío, así que se corta aquí con el texto literal (403: la sesión sigue siendo válida).
-  const acceso = await tieneAcceso(locationId, { log })
-  if (!acceso.access) throw fallo(403, MENSAJE_SIN_ACCESO)
-
-  // Lista de supresión: se comprueban TODOS los destinatarios, no solo el principal. El mensaje se
-  // guarda igualmente aunque no salga, para que quede rastro en el hilo y en el historial.
-  const bloqueados = await filtrarSuprimidos(locationId, [destino, ...cc, ...bcc])
-  const supresion = bloqueados.get(destino.toLowerCase()) ?? null
-  const sinSuprimir = (lista) => {
-    const quedan = lista.filter((d) => !bloqueados.has(d.toLowerCase()))
-    return quedan.length ? quedan : null
-  }
-  const ccFinal = sinSuprimir(cc)
-  const bccFinal = sinSuprimir(bcc)
-
-  const estado = supresion ? 'suprimido' : 'encolado'
-  const rango = supresion ? RANGO_SUPRIMIDO : RANGO_ENCOLADO
-  const ultimoError = supresion ? `Destinatario en la lista de supresión (${supresion.reason})` : null
-
-  // Límite de envíos de la subcuenta: solo si el mensaje va a salir de verdad.
-  if (!supresion) {
-    const cupo = await consumirLimiteEnvio(locationId)
-    if (!cupo.ok) throw fallo(429, cupo.motivo || 'Se ha alcanzado el límite de envíos de esta subcuenta')
-  }
+  // Responder, reenviar o redactar desde el buzón también es un envío: suscripción en el Marketplace
+  // Disruptivo (403 con el texto literal; la sesión sigue siendo válida), lista de supresión de
+  // TODOS los destinatarios (si cae el principal el mensaje se guarda igualmente como 'suprimido',
+  // para que quede rastro en el hilo y en el historial) y límite de envíos de la subcuenta (429,
+  // solo si el mensaje va a salir de verdad). Todo en src/lib/encolar.js.
+  const { bloqueados, supresion, estado, rango, ultimoError, cc: ccFinal, bcc: bccFinal } =
+    await comprobarEncolado({ locationId, log, destino, cc, bcc })
 
   const correlacion = randomCorrelationId()
   const { rows: [insertado] } = await q(
@@ -624,19 +586,7 @@ async function encolarDesdeBuzon({
   )
 
   // Copias suprimidas: queda escrito en el histórico por qué a esa dirección no le llegó nada.
-  if (bloqueados.size && !supresion) {
-    await q(
-      `INSERT INTO message_events (message_id, event, occurred_at, dedupe_key, data)
-       VALUES ($1,'destinatarios_suprimidos', now(), 'buzon-supresion', $2::jsonb)
-       ON CONFLICT (message_id, dedupe_key) DO NOTHING`,
-      [
-        insertado.id,
-        JSON.stringify({
-          direcciones: Object.fromEntries([...bloqueados].map(([email, f]) => [email, f.reason])),
-        }),
-      ]
-    ).catch((err) => log?.warn?.({ err, mensaje: insertado.id }, 'buzón: no se pudo registrar la supresión parcial'))
-  }
+  if (bloqueados.size && !supresion) await registrarCopiasSuprimidas(insertado.id, bloqueados, 'buzon-supresion', log)
 
   // Contestar o reenviar algo es haberlo leído.
   if (original) await q('UPDATE inbox_messages SET is_read = true WHERE id = $1 AND NOT is_read', [original.id])
@@ -1265,7 +1215,7 @@ export default async function buzonRoutes(app) {
 
     try {
       const remitente = await resolverRemitente(locationId, b.sender_id, original.reply_sender_id)
-      const proveedor = await proveedorDe(remitente, locationId)
+      const proveedor = await proveedorParaResponder(remitente, locationId)
 
       // Responder a todos: los destinatarios del original menos nosotros (la cuenta del buzón y el
       // remitente con el que salimos) y menos el destino principal.
@@ -1328,7 +1278,7 @@ export default async function buzonRoutes(app) {
 
     try {
       const remitente = await resolverRemitente(locationId, b.sender_id, original.reply_sender_id)
-      const proveedor = await proveedorDe(remitente, locationId)
+      const proveedor = await proveedorParaResponder(remitente, locationId)
 
       const [destino, ...resto] = para.lista
       const cc = [...resto]
@@ -1396,7 +1346,7 @@ export default async function buzonRoutes(app) {
 
     try {
       const remitente = await resolverRemitente(locationId, b.sender_id, cuenta?.reply_sender_id)
-      const proveedor = await proveedorDe(remitente, locationId)
+      const proveedor = await proveedorParaResponder(remitente, locationId)
 
       const [destino, ...resto] = para.lista
       const cc = [...resto]

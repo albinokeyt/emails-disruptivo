@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api } from '../api.js'
+import { adminObtenerEnvio, adminProbarRemitente, api } from '../api.js'
 import {
   Aviso,
   Badge,
@@ -13,6 +13,8 @@ import {
   Spinner,
   Tabla,
 } from '../components/ui.jsx'
+// «Enviar prueba»: modal compartido con la pantalla de subcuenta (encola y sigue el resultado en vivo)
+import PruebaRemitente from '../components/PruebaRemitente.jsx'
 
 const TARJETA = 'bg-card border border-border rounded-2xl p-5'
 
@@ -46,6 +48,7 @@ export default function RemitentesAdmin() {
   const [errores, setErrores] = useState([])
   const [guardando, setGuardando] = useState(false)
   const [aBorrar, setABorrar] = useState(null)
+  const [aProbar, setAProbar] = useState(null) // remitente del modal «Enviar correo de prueba»
 
   const cargar = useCallback(async (locationId) => {
     setDatos(null)
@@ -200,6 +203,14 @@ export default function RemitentesAdmin() {
                   <div className="text-[11px] text-mut">{ORIGEN[s.origin] || s.origin}</div>
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 text-right whitespace-nowrap">
+                  <button
+                    type="button"
+                    className="text-xs text-gold hover:underline mr-3"
+                    title="Envía un correo automático desde este remitente, en su subcuenta y por su proveedor"
+                    onClick={() => setAProbar(s)}
+                  >
+                    Enviar prueba
+                  </button>
                   <button type="button" className="text-xs text-ink2 hover:text-ink mr-3" onClick={() => abrirEditar(s)}>
                     Editar
                   </button>
@@ -212,6 +223,19 @@ export default function RemitentesAdmin() {
           </Tabla>
         )}
       </div>
+
+      {/* el GET de la agencia ya trae el nombre del proveedor (propio o cedido); el listado de
+          /api/admin/proveedores solo tiene los de la agencia, así que va de respaldo */}
+      {aProbar && (
+        <PruebaRemitente
+          remitente={aProbar}
+          nombreProveedor={aProbar.proveedor_nombre || nombreProveedor(aProbar.provider_id)}
+          probar={adminProbarRemitente}
+          obtenerEnvio={adminObtenerEnvio}
+          rutaEnvios="/admin/envios"
+          onCerrar={() => setAProbar(null)}
+        />
+      )}
 
       {modal && (
         <Modal title={modal.id ? 'Editar remitente' : 'Nuevo remitente'} onClose={() => setModal(null)}>

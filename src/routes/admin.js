@@ -43,6 +43,9 @@ import { comprobarCertificadoTraefik, estadoTraefik } from '../lib/traefik.js'
 import { tamanoLegible } from '../lib/buzon.js'
 // Suscripción de cada subcuenta en el Marketplace Disruptivo (solo lectura y recomprobación).
 import { estadoMarketplace, invalidarAcceso, resumenAccesoAdmin, tieneAcceso } from '../lib/marketplace.js'
+// «Enviar prueba» de un remitente de cualquier subcuenta: mismo encolado que el panel de subcuenta.
+import { proveedorDe } from '../lib/encolar.js'
+import { encolarPrueba } from '../lib/envio-prueba.js'
 
 // SPEC §5.3 — API del panel de la agencia. Todo bajo requireAdmin salvo el propio login.
 // Los secretos guardados (client_secret, shared_secret, credenciales de proveedor) NUNCA se
@@ -614,6 +617,35 @@ export default async function adminRoutes(app) {
     return { ok: true }
   })
 
+  // «Enviar prueba» desde la agencia: el remitente lleva su subcuenta (senders.location_id) y la
+  // prueba se encola EN ESA subcuenta con su proveedor (propio o cedido), así que cuenta contra su
+  // límite de envíos y se corta si su suscripción no está activa, igual que desde su propio panel.
+  // Destino: body.para o el email del administrador si entró por SSO (con usuario y contraseña la
+  // sesión no trae email y hay que indicarlo). El resultado se sigue por GET /api/admin/envios/:id.
+  app.post('/api/admin/remitentes/:id/prueba', guard, async (req, reply) => {
+    const id = idDe(req.params.id)
+    if (!id) return malo(reply, 'Identificador de remitente no válido')
+    const { rows: [remitente] } = await q('SELECT * FROM senders WHERE id=$1', [id])
+    if (!remitente) return reply.code(404).send({ error: 'Remitente no encontrado' })
+
+    const b = req.body || {}
+    const destino = texto(b.para).toLowerCase() || texto(req.sesion?.email).toLowerCase()
+    if (!destino) return malo(reply, 'Indica a qué dirección enviar la prueba')
+    if (!esEmail(destino)) return malo(reply, 'La dirección a la que enviar la prueba no es válida')
+
+    try {
+      const proveedor = await proveedorDe(remitente, remitente.location_id, { accion: 'enviar la prueba' })
+      const resultado = await encolarPrueba({
+        locationId: remitente.location_id, log: req.log, remitente, proveedor, destino,
+      })
+      return reply.code(201).send({ ...resultado, location_id: remitente.location_id })
+    } catch (err) {
+      // 400 sin proveedor utilizable · 403 sin suscripción · 429 límite de pruebas o de envíos
+      if (err?.codigo) return reply.code(err.codigo).send({ error: err.message })
+      throw err
+    }
+  })
+
   // ---------------------------------------------------------------------------
   // Plantillas (location_id null = global, visible por todas las subcuentas)
   // ---------------------------------------------------------------------------
@@ -763,6 +795,45 @@ export default async function adminRoutes(app) {
       limite,
       paginas: Math.max(1, Math.ceil(total.rows[0].n / limite)),
     }
+  })
+
+  // Detalle de un envío de cualquier subcuenta, con la misma forma que GET /api/loc/envios/:id
+  // ({ envio, eventos, seguimiento }) más `subcuenta_nombre`. Lo usa «Enviar prueba» de Remitentes
+  // para enseñar en vivo lo que dijo el proveedor.
+  app.get('/api/admin/envios/:id', guard, async (req, reply) => {
+    const id = idDe(req.params.id)
+    if (!id) return malo(reply, 'Identificador de envío no válido')
+    const { rows: [envio] } = await q(
+      `SELECT m.*, s.email AS remitente_email, s.name AS remitente_nombre,
+              p.name AS proveedor_nombre, p.type AS proveedor_tipo, t.name AS plantilla_nombre,
+              c.name AS subcuenta_nombre
+         FROM messages m
+         LEFT JOIN senders s ON s.id = m.sender_id
+         LEFT JOIN providers p ON p.id = m.provider_id
+         LEFT JOIN templates t ON t.id = m.template_id
+         LEFT JOIN connections c ON c.location_id = m.location_id
+        WHERE m.id=$1`,
+      [id]
+    )
+    if (!envio) return reply.code(404).send({ error: 'Envío no encontrado' })
+    // Igual que en el panel de subcuenta: `automatico` por evento y agregados solo de los reales.
+    const [{ rows: eventos }, { rows: [seguimiento] }] = await Promise.all([
+      q(
+        `SELECT id, event, occurred_at, data, automatico, created_at FROM message_events
+          WHERE message_id=$1 ORDER BY occurred_at DESC, id DESC LIMIT 200`,
+        [id]
+      ),
+      q(
+        `SELECT
+           (COUNT(*) FILTER (WHERE event = 'apertura' AND NOT automatico))::int AS aperturas,
+           (COUNT(*) FILTER (WHERE event = 'clic' AND NOT automatico))::int AS clics,
+           (COUNT(*) FILTER (WHERE event = 'apertura' AND automatico))::int AS aperturas_automaticas,
+           (COUNT(*) FILTER (WHERE event = 'clic' AND automatico))::int AS clics_automaticos
+         FROM message_events WHERE message_id=$1`,
+        [id]
+      ),
+    ])
+    return { envio, eventos, seguimiento }
   })
 
   // ---------------------------------------------------------------------------

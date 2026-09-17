@@ -104,6 +104,10 @@ export const listarRemitentes = () => api.get('/api/loc/remitentes')
 export const crearRemitente = (datos) => api.post('/api/loc/remitentes', datos)
 export const actualizarRemitente = (id, datos) => api.patch(`/api/loc/remitentes/${id}`, datos)
 export const eliminarRemitente = (id) => api.del(`/api/loc/remitentes/${id}`)
+// «Enviar prueba»: encola un correo automático por el proveedor del remitente (origin 'prueba').
+// `para` vacío = el email de la sesión. → 201 { ok, message_id, estado, to_email, remitente, proveedor }
+// El resultado se sigue con obtenerEnvio(message_id) hasta que el estado deje de ser de cola.
+export const probarRemitente = (id, para) => api.post(`/api/loc/remitentes/${id}/prueba`, { para: para || undefined })
 
 export const listarPlantillas = () => api.get('/api/loc/plantillas')
 export const crearPlantilla = (datos) => api.post('/api/loc/plantillas', datos)
@@ -232,6 +236,9 @@ export const adminListarRemitentes = (filtros) => api.get(`/api/admin/remitentes
 export const adminCrearRemitente = (datos) => api.post('/api/admin/remitentes', datos)
 export const adminActualizarRemitente = (id, datos) => api.patch(`/api/admin/remitentes/${id}`, datos)
 export const adminEliminarRemitente = (id) => api.del(`/api/admin/remitentes/${id}`)
+// Mismo contrato que probarRemitente: la prueba se encola en la subcuenta del remitente, con su
+// proveedor (propio o cedido); la respuesta añade `location_id`. Se sigue con adminObtenerEnvio.
+export const adminProbarRemitente = (id, para) => api.post(`/api/admin/remitentes/${id}/prueba`, { para: para || undefined })
 
 // location_id null = plantilla global visible por todas las subcuentas
 export const adminListarPlantillas = (filtros) => api.get(`/api/admin/plantillas${consulta(filtros)}`)
@@ -241,6 +248,8 @@ export const adminEliminarPlantilla = (id) => api.del(`/api/admin/plantillas/${i
 
 // filtros: { location_id, estado, desde, hasta, q, origen, pagina, limite }
 export const adminListarEnvios = (filtros) => api.get(`/api/admin/envios${consulta(filtros)}`)
+// misma forma que obtenerEnvio: { envio, eventos, seguimiento } (+ envio.subcuenta_nombre)
+export const adminObtenerEnvio = (id) => api.get(`/api/admin/envios/${id}`)
 
 export const adminActivarRelay = (locationId) =>
   api.post(`/api/admin/subcuentas/${encodeURIComponent(locationId)}/relay`)

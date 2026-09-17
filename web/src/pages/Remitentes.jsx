@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, esDominioGratuito } from '../api.js'
+import { api, esDominioGratuito, obtenerEnvio, probarRemitente } from '../api.js'
 import {
   Aviso,
   Badge,
@@ -13,6 +13,8 @@ import {
   Spinner,
   Tabla,
 } from '../components/ui.jsx'
+// «Enviar prueba»: modal compartido con la pantalla de la agencia (encola y sigue el resultado en vivo)
+import PruebaRemitente from '../components/PruebaRemitente.jsx'
 
 const TARJETA = 'bg-card border border-border rounded-2xl p-5'
 
@@ -60,6 +62,7 @@ export default function Remitentes() {
   const [errores, setErrores] = useState([])
   const [guardando, setGuardando] = useState(false)
   const [aBorrar, setABorrar] = useState(null)
+  const [aProbar, setAProbar] = useState(null) // remitente del modal «Enviar correo de prueba»
 
   const cargar = useCallback(async () => {
     try {
@@ -226,6 +229,14 @@ export default function Remitentes() {
                     <div className="text-[11px] text-mut">{ORIGEN[s.origin] || s.origin}</div>
                   </td>
                   <td className="px-3 py-2.5 text-sm border-t border-border/60 text-right whitespace-nowrap">
+                    <button
+                      type="button"
+                      className="text-xs text-gold hover:underline mr-3"
+                      title="Envía un correo automático desde este remitente para comprobar que funciona"
+                      onClick={() => setAProbar(s)}
+                    >
+                      Enviar prueba
+                    </button>
                     <button type="button" className="text-xs text-ink2 hover:text-ink mr-3" onClick={() => abrirEditar(s)}>
                       Editar
                     </button>
@@ -239,6 +250,17 @@ export default function Remitentes() {
           </Tabla>
         )}
       </div>
+
+      {aProbar && (
+        <PruebaRemitente
+          remitente={aProbar}
+          nombreProveedor={aProbar.proveedor_nombre || nombreProveedor(aProbar.provider_id)}
+          probar={probarRemitente}
+          obtenerEnvio={obtenerEnvio}
+          rutaEnvios="/envios"
+          onCerrar={() => setAProbar(null)}
+        />
+      )}
 
       <div className={TARJETA}>
         <div className="text-sm font-semibold mb-2">Sobre la verificación</div>

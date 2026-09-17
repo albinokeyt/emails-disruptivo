@@ -437,6 +437,8 @@ const ESTADOS = {
   nodo_plantilla: { etiqueta: 'Nodo plantilla', clase: ORO },
   nodo_personalizado: { etiqueta: 'Nodo personalizado', clase: ORO },
   relay: { etiqueta: 'Relay SMTP', clase: INFO },
+  buzon: { etiqueta: 'Buzón', clase: INFO },
+  prueba: { etiqueta: 'Prueba', clase: NEUTRO },
 
   // origen del remitente
   panel: { etiqueta: 'Panel', clase: NEUTRO },

@@ -27,6 +27,8 @@ const ORIGENES = [
   ['nodo_plantilla', 'Nodo con plantilla'],
   ['nodo_personalizado', 'Nodo personalizado'],
   ['relay', 'Relay SMTP'],
+  ['buzon', 'Buzón'],
+  ['prueba', 'Prueba de remitente'],
 ]
 
 const VACIOS = { location_id: '', estado: '', origen: '', desde: '', hasta: '', q: '' }

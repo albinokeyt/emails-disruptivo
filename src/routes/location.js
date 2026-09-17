@@ -14,6 +14,10 @@ import { olvidarDominioTracking } from '../lib/tracking.js'
 // SPEC §12: aplicarDnd activa el DND del canal Email del contacto en GHL (resolviendo el contacto
 // por email si la supresión no trae ghl_contact_id) y deja el resultado en dnd_at/dnd_error.
 import { aplicarDnd } from '../lib/dnd.js'
+// «Enviar prueba» de Remitentes: proveedor del remitente (propio o cedido) y encolado por la cola
+// normal con origin='prueba'; las puertas (suscripción, supresión, límite) viven en lib/encolar.js.
+import { proveedorDe } from '../lib/encolar.js'
+import { encolarPrueba } from '../lib/envio-prueba.js'
 import { urlWebhookBrevo } from './webhooks.js'
 
 // SPEC §5.2 — API del panel de subcuenta. TODAS las rutas van bajo requireLocation y TODAS las
@@ -24,7 +28,8 @@ const ESTADOS = new Set([
   'encolado', 'reintento', 'enviando', 'enviado', 'diferido',
   'entregado', 'rebotado', 'spam', 'fallido', 'suprimido',
 ])
-const ORIGENES = new Set(['nodo_plantilla', 'nodo_personalizado', 'relay'])
+// Los mismos valores que el CHECK de messages.origin (migraciones 005 y 006)
+const ORIGENES = new Set(['nodo_plantilla', 'nodo_personalizado', 'relay', 'buzon', 'prueba'])
 const MOTIVOS_SUPRESION = new Set(['rebote_duro', 'spam', 'baja', 'manual'])
 const TIPOS_PROVEEDOR = new Set(['smtp', 'brevo'])
 
@@ -1116,6 +1121,33 @@ export default async function locationRoutes(app) {
     }
     await q('DELETE FROM senders WHERE id=$1 AND location_id=$2', [id, locationId])
     return { ok: true }
+  })
+
+  // «Enviar prueba»: un correo automático que sale por el proveedor del propio remitente y por la
+  // cola normal (origin='prueba'), para comprobar que el remitente funciona sin montar un workflow
+  // ni pasar por el Buzón. El panel enseña después el resultado consultando GET /api/loc/envios/:id.
+  // Destino: body.para o, si no viene, el email del usuario de GHL que abrió el panel (sesión SSO).
+  app.post('/api/loc/remitentes/:id/prueba', guard, async (req, reply) => {
+    const id = idDe(req.params.id)
+    if (!id) return malo(reply, 'Identificador de remitente no válido')
+    const locationId = loc(req)
+    const { rows: [remitente] } = await q('SELECT * FROM senders WHERE id=$1 AND location_id=$2', [id, locationId])
+    if (!remitente) return reply.code(404).send({ error: 'Remitente no encontrado' })
+
+    const b = req.body || {}
+    const destino = texto(b.para).toLowerCase() || texto(req.sesion?.email).toLowerCase()
+    if (!destino) return malo(reply, 'Indica a qué dirección enviar la prueba')
+    if (!esEmail(destino)) return malo(reply, 'La dirección a la que enviar la prueba no es válida')
+
+    try {
+      const proveedor = await proveedorDe(remitente, locationId, { accion: 'enviar la prueba' })
+      const resultado = await encolarPrueba({ locationId, log: req.log, remitente, proveedor, destino })
+      return reply.code(201).send(resultado)
+    } catch (err) {
+      // 400 sin proveedor utilizable · 403 sin suscripción · 429 límite de pruebas o de envíos
+      if (err?.codigo) return reply.code(err.codigo).send({ error: err.message })
+      throw err
+    }
   })
 
   // ---------------------------------------------------------------------------

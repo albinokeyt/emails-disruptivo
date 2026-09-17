@@ -115,7 +115,8 @@ Una subcuenta ve las suyas **y** las globales.
 ### `messages` — cola de envío e historial (fuente única de verdad)
 `id bigserial PK` · `location_id text NOT NULL` · `provider_id bigint FK providers` ·
 `sender_id bigint FK senders` · `template_id bigint NULL FK templates` ·
-`origin text NOT NULL` (`nodo_plantilla|nodo_personalizado|relay`) ·
+`origin text NOT NULL` (`nodo_plantilla|nodo_personalizado|relay|buzon|prueba`; `buzon` = respuesta o
+correo nuevo desde el Buzón, §14; `prueba` = «Enviar prueba» de la pantalla Remitentes, §5.2) ·
 `status text NOT NULL DEFAULT 'encolado'` · `status_rank int NOT NULL DEFAULT 0` ·
 `to_email citext NOT NULL` · `to_name text` · `cc text[]` · `bcc text[]` · `reply_to text` ·
 `subject text NOT NULL` · `preheader text` · `html text` · `text text` ·
@@ -195,8 +196,9 @@ Errores: `{ "error": "mensaje en español" }` con el código HTTP adecuado.
 | DELETE | `/api/loc/proveedores/:id` | 409 si tiene remitentes o mensajes en cola |
 | POST | `/api/loc/proveedores/:id/probar` | valida credenciales contra el proveedor → `{ok, detalle}` |
 | GET/POST/PATCH/DELETE | `/api/loc/remitentes[/:id]` | `{email, name, reply_to, provider_id, is_default}` |
+| POST | `/api/loc/remitentes/:id/prueba` | **Enviar prueba**: `{para?}` (sin `para` → email de la sesión SSO; sin ninguno → 400 «Indica a qué dirección enviar la prueba»). Encola por la cola normal un correo automático desde ese remitente y por SU proveedor (propio o cedido; sin proveedor utilizable → 400), `origin='prueba'`, asunto `Prueba de Emails Disruptivo · <nombre> <email>`, HTML con el look del panel (remitente, proveedor, fecha en Europe/Madrid, «si lees esto, el remitente funciona») y texto plano equivalente, `reply_to` del remitente. Mismas puertas que el Buzón: 403 `MENSAJE_SIN_ACCESO`, supresión (nace `suprimido` con `aviso`) y límite de envíos (429); además máximo 10 pruebas por remitente y hora (429). → `201 {ok, message_id, estado, to_email, subject, remitente:{id,email,name}, proveedor:{id,name,type}, created_at, aviso?}`; el panel sigue el resultado con `GET /api/loc/envios/:id` |
 | GET/POST/PATCH/DELETE | `/api/loc/plantillas[/:id]` | globales visibles en GET, no editables |
-| GET | `/api/loc/envios` | filtros `estado`, `desde`, `hasta`, `q`, `origen`; paginado |
+| GET | `/api/loc/envios` | filtros `estado`, `desde`, `hasta`, `q`, `origen` (`nodo_plantilla|nodo_personalizado|relay|buzon|prueba`); paginado |
 | GET | `/api/loc/envios/:id` | mensaje + su `message_events` |
 | GET/POST/DELETE | `/api/loc/supresiones[/:id]` | alta y baja manual |
 | GET/POST/DELETE | `/api/loc/dominios[/:id]` | GET incluye `dominios_remitentes` (dominios reales de los remitentes, con `gratuito`); el POST solo admite dominios presentes en los remitentes de la subcuenta (y nunca de correo gratuito); `POST /:id/verificar` comprueba el TXT; DELETE renuncia a la exclusividad |
@@ -214,8 +216,10 @@ Errores: `{ "error": "mensaje en español" }` con el código HTTP adecuado.
 | GET/POST/PATCH/DELETE | `/api/admin/proveedores[/:id]` | proveedores de ámbito admin |
 | GET/POST/DELETE | `/api/admin/proveedores/:id/asignaciones[/:locationId]` | ceder a subcuentas |
 | GET/POST/PATCH/DELETE | `/api/admin/remitentes[/:id]` | con `location_id` obligatorio en POST |
+| POST | `/api/admin/remitentes/:id/prueba` | **Enviar prueba** desde la agencia: mismo cuerpo, lógica, límites y respuesta que `POST /api/loc/remitentes/:id/prueba` (+ `location_id`), pero la prueba se encola EN LA SUBCUENTA del remitente (`senders.location_id`) con su proveedor (propio o cedido): cuenta contra el límite de esa subcuenta y se corta con 403 si su suscripción no está activa. Sin `para` → email del administrador si entró por SSO (con usuario y contraseña la sesión no trae email: 400 hasta que lo indique) |
 | GET/POST/PATCH/DELETE | `/api/admin/plantillas[/:id]` | `location_id` null = global |
 | GET | `/api/admin/envios` | vista global con filtro por subcuenta |
+| GET | `/api/admin/envios/:id` | detalle de un envío de cualquier subcuenta, misma forma que `GET /api/loc/envios/:id` (`{envio, eventos, seguimiento}`) más `envio.subcuenta_nombre`; lo usa el modal de «Enviar prueba» |
 | POST | `/api/admin/subcuentas/:locationId/relay` | activa el relay a una subcuenta y devuelve sus datos (misma forma que `GET /api/loc/relay`, incluido `servidor_activo`; contraseña en `contrasena` **una sola vez**) |
 | GET/PUT | `/api/admin/ajustes` | credenciales GHL, shared secret, límites (secretos enmascarados al leer) |
 
@@ -343,7 +347,13 @@ Ruta base `/` = panel de subcuenta (dentro del iframe), `/admin/*` = panel de ad
 
 **Subcuenta:** `Resumen` · `Proveedores` (alta SMTP/Brevo con formulario según `camposCredenciales`,
 botón *Probar conexión*, sección de proveedores cedidos por el admin en solo lectura) ·
-`Remitentes` (alta con correo y nombre, elección de proveedor, aviso de verificación de dominio) ·
+`Remitentes` (alta con correo y nombre, elección de proveedor, aviso de verificación de dominio; botón
+**Enviar prueba** por fila → modal «Enviar correo de prueba» con el remitente y su proveedor, campo
+«Enviar a» prefijado con el email de la sesión y, tras el 201, el resultado en vivo: sondea
+`GET /api/loc/envios/:id` cada 2 s hasta 45 s o hasta que el estado salga de encolado/enviando/reintento,
+y enseña el Badge del estado con «Aceptado por <proveedor>» si enviado/entregado, `last_error` en rojo si
+fallido/rebotado/diferido, «Sigue en cola, míralo en Envíos» si se agota el plazo, y enlace «Ver en
+Envíos»; los 400/403/429 del backend salen como Aviso dentro del modal; el sondeo se cancela al cerrar) ·
 `Plantillas` (asunto, preheader, editor HTML, vista previa y lista de variables) ·
 `Envios` (tabla con filtros y detalle con el histórico de eventos) ·
 `Relay` (interruptor de activación, datos SMTP para pegar en GHL con botón de copiar, contraseña
@@ -352,11 +362,14 @@ visible una sola vez, proveedor por defecto y explicación del enrutado por remi
 del GET —, con estado por dominio [gratuito «no aplica» / sin verificar / pendiente con guía TXT en
 3 pasos / verificado], botón de verificar/comprobar/quitar y sección de huérfanos sin remitente).
 
-**Admin:** `Login` · `Subcuentas` · `ProveedoresAdmin` · `Asignaciones` · `RemitentesAdmin` ·
-`PlantillasAdmin` · `EnviosAdmin` · `Ajustes`.
+**Admin:** `Login` · `Subcuentas` · `ProveedoresAdmin` · `Asignaciones` · `RemitentesAdmin` (mismo botón
+**Enviar prueba** por fila, contra `POST /api/admin/remitentes/:id/prueba` y siguiendo el resultado con
+`GET /api/admin/envios/:id`; enlace a `/admin/envios`) · `PlantillasAdmin` · `EnviosAdmin` · `Ajustes`.
 
 Componentes compartidos en `web/src/components/ui.jsx`:
 `Boton, Campo, Select, Textarea, Interruptor, Modal, Tabla, Badge, Aviso, Spinner, Confirmar, Copiar`.
+El modal de «Enviar prueba» vive en `web/src/components/PruebaRemitente.jsx` y lo usan las dos pantallas
+de remitentes (recibe las llamadas `probar`/`obtenerEnvio` y la ruta de Envíos de cada panel).
 
 ---
 

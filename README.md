@@ -77,6 +77,18 @@ Es decir: **nunca se rechaza por usar un remitente distinto al configurado**; se
 Lo que sí se mantiene siempre: límite de tamaño del mensaje, límite de destinatarios, límites por
 minuto y por día, lista de supresión y cabeceras `List-Unsubscribe` + `List-Unsubscribe-Post`.
 
+### Probar un remitente sin montar un workflow
+
+- **Enviar prueba.** En *Remitentes* (y en *Remitentes* del panel de la agencia) cada fila tiene un
+  botón **Enviar prueba**: encola un correo automático desde ese remitente, **por su proveedor** (el
+  propio o el cedido por la agencia) y por la cola normal, con `origin='prueba'`. Eliges o confirmas
+  la dirección de destino (por defecto, el correo con el que abriste el panel) y el modal enseña el
+  resultado en vivo: «Aceptado por <proveedor>» o el error real que devolvió (credenciales, remitente
+  no verificado en Brevo, host SMTP caído…), sin abrir el Buzón ni tocar GHL. Pasa por las mismas
+  puertas que cualquier otro correo (suscripción del marketplace, lista de supresión, límites de la
+  subcuenta) y además admite como mucho 10 pruebas por remitente y hora. Queda en *Envíos* con el
+  origen «Prueba de remitente».
+
 ---
 
 ## Buzón: correo entrante por IMAP
@@ -217,9 +229,12 @@ emails-disruptivo/
 │  │  ├─ 001_init.sql     esquema base (idempotente, cada una se aplica una sola vez)
 │  │  ├─ 002_tracking.sql · 003_rebotados.sql
 │  │  ├─ 004_tls.sql      tabla tls_certificates (certificado del relay, clave cifrada)
-│  │  └─ 005_buzon.sql    mailboxes, inbox_messages, inbox_attachments, cuota y origen 'buzon'
+│  │  ├─ 005_buzon.sql    mailboxes, inbox_messages, inbox_attachments, cuota y origen 'buzon'
+│  │  └─ 006_prueba.sql   origen 'prueba' en messages («Enviar prueba» de Remitentes)
 │  ├─ lib/
 │  │  ├─ crypto.js        AES-256-GCM para credenciales · scrypt para el relay
+│  │  ├─ encolar.js       puertas comunes del encolado desde el panel (suscripción, supresión, límite)
+│  │  ├─ envio-prueba.js  «Enviar prueba» de un remitente: cuerpo del correo y encolado (origin 'prueba')
 │  │  ├─ buzon.js         buzón: saneado del HTML, thread_key, cuota y borrado con descuento
 │  │  ├─ buzon-sync.js    bucle IMAP del buzón: sincronizar, probar, borrar en el servidor
 │  │  ├─ acme.js          certificado Let's Encrypt del relay: emisión, estado y renovación
@@ -257,6 +272,7 @@ emails-disruptivo/
       ├─ App.jsx · api.js · sso.js
       ├─ components/ui.jsx    Boton, Campo, Select, Textarea, Interruptor, Modal,
       │                       Tabla, Badge, Aviso, Spinner, Confirmar, Copiar
+      ├─ components/PruebaRemitente.jsx   modal «Enviar correo de prueba» (subcuenta y agencia)
       └─ pages/               Resumen, Proveedores, Remitentes, Plantillas, Envios,
                               Buzon, Relay, Dominios + las de /admin/*
 ```

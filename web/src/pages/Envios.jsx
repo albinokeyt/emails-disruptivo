@@ -27,6 +27,8 @@ export const ORIGENES = [
   ['nodo_plantilla', 'Nodo con plantilla'],
   ['nodo_personalizado', 'Nodo personalizado'],
   ['relay', 'Relay SMTP'],
+  ['buzon', 'Buzón'],
+  ['prueba', 'Prueba de remitente'],
 ]
 
 // Nombres legibles de los eventos del histórico; si llega uno nuevo se muestra tal cual.
