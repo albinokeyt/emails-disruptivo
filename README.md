@@ -110,6 +110,11 @@ hay que configurar nada en GHL: vive dentro de la misma Custom Page.
   subcuenta; pasa por la lista de supresión y por los límites como cualquier otro correo, y aparece
   en *Envíos* y en la carpeta «Enviados desde el buzón». El original se cita al final. Reenviar no
   lleva los adjuntos del original (v1): el panel lo avisa.
+- **Redactar.** Botón en la cabecera del Buzón para escribir un correo nuevo desde cero (remitente,
+  cuenta del buzón en la que recibir las respuestas, uno o varios Para, CC, CCO, asunto y texto con
+  vista previa): sale por la misma cola que las respuestas (`POST /api/loc/buzon/redactar`), con
+  las contestaciones volviendo a la cuenta del buzón elegida (por defecto la activa o la única que
+  haya). Sin adjuntos en v1.
 
 ### IMAP, no POP3
 

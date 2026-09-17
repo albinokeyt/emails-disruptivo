@@ -183,6 +183,8 @@ export const urlAdjuntoBuzon = (id) => `/api/loc/buzon/adjuntos/${id}`
 export const responderMensajeBuzon = (id, datos) => api.post(`/api/loc/buzon/mensajes/${id}/responder`, datos)
 // { to, html, text, sender_id? } — sin adjuntos en esta versión
 export const reenviarMensajeBuzon = (id, datos) => api.post(`/api/loc/buzon/mensajes/${id}/reenviar`, datos)
+// Correo nuevo: { mailbox_id?, sender_id?, para, cc?, bcc?, asunto, cuerpo, html? } → misma cola que responder
+export const redactarDesdeBuzon = (datos) => api.post('/api/loc/buzon/redactar', datos)
 // → { usado_bytes, cuota_mb, porcentaje, por_cuenta:[…] }
 export const obtenerEspacioBuzon = () => api.get('/api/loc/buzon/espacio')
 

@@ -721,6 +721,7 @@ pasada. Exporta `arrancarSyncBuzon(log)` / `pararSyncBuzon()` y `sincronizarBuzo
 | GET | `/api/loc/buzon/adjuntos/:id` | descarga con `Content-Disposition`; comprueba que el mensaje es de la subcuenta |
 | POST | `/api/loc/buzon/mensajes/:id/responder` | `{html, text, sender_id?, todos:boolean, cc, bcc}` → encola con cabeceras de hilo, asunto `Re: …`, cita del original al final |
 | POST | `/api/loc/buzon/mensajes/:id/reenviar` | `{to, html, text, sender_id?}` → asunto `Fwd: …` (sin adjuntos en v1: se avisa en la UI) |
+| POST | `/api/loc/buzon/redactar` | correo nuevo, sin original: `{mailbox_id?, sender_id?, para: string\|string[], cc?, bcc?, asunto, cuerpo, html?}`. `para` admite uno o varios (coma, punto y coma o array): el primero va en `to_email` y el resto en copia; máximo 20 direcciones entre Para, CC y CCO; `asunto` obligatorio (≤ 255); `cuerpo` es texto plano que se convierte a HTML escapado, o `html` ya montado (entonces `cuerpo` es su versión en texto). Remitente: `sender_id` → `reply_sender_id` de `mailbox_id` → el por defecto de la subcuenta (siempre de la subcuenta, si no 400). Con `mailbox_id`, el Reply-To es esa cuenta IMAP para que la contestación entre por el buzón. Misma inserción en `messages` (`origin='buzon'`), supresión, límite de envíos y corte de suscripción (403 `MENSAJE_SIN_ACCESO`) que responder; sin `In-Reply-To` ni `inbox_reply_to_id`, y `thread_key` = `correlation_id` (hilo nuevo: la contestación lo hereda por `provider_message_id`). → `201 {ok, message_id, estado, remitente, to_email, cc, bcc, subject, aviso?}`; `400 {error}` si falta algo. Sin adjuntos en v1 |
 | GET | `/api/loc/buzon/espacio` | `{usado_bytes, cuota_mb, porcentaje, por_cuenta:[…]}` |
 
 Admin (`requireAdmin`, en `src/routes/admin.js`): `GET /api/admin/buzon/espacio` (uso y cuota de todas
@@ -734,6 +735,14 @@ defecto `buzon_quota_mb` dentro de `PUT /api/admin/ajustes` (`limites`).
   el hilo (recibidos y nuestras respuestas con su estado de entrega), HTML en `<iframe sandbox>` con
   imágenes bloqueadas por defecto, adjuntos descargables, botones Responder / Responder a todos /
   Reenviar / Borrar (con opción «también del servidor»). Barra superior de espacio «X MB de Y MB».
+  Botón **Redactar** en la cabecera (junto a Sincronizar y Cuentas): modal «Nuevo correo» con Enviar
+  desde (preselecciona el remitente de la cuenta), «Recibir las respuestas en» (selector de cuenta
+  activa del buzón = `mailbox_id`, preselecciona la cuenta activa o la única que haya; con varias se
+  puede elegir «Ninguna», y al cambiarla Enviar desde pasa a su remitente configurado), Para (varios
+  separados por coma), CC, CCO, Asunto y el mismo editor Escribir / Vista previa de las respuestas;
+  validación en cliente (correos, máximo 20 direcciones, asunto obligatorio ≤ 255); al enviar abre
+  la carpeta «Enviados desde el buzón» con todas las cuentas. Sin adjuntos en v1 (se indica en el
+  modal).
 - **Engranaje** ⚙ en la cabecera de Buzón: modal con la lista de cuentas y el formulario
   (nombre, correo, servidor IMAP, puerto, TLS, usuario, contraseña, carpeta, «Qué hacer tras traer el
   correo: dejar copia / borrar del servidor», cada cuántos minutos, remitente para responder),

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, registrarWebhookProveedorAdmin } from '../api.js'
+import { adminProbarProveedor, api, registrarWebhookProveedorAdmin } from '../api.js'
 import { WebhookBrevo } from './Proveedores.jsx'
 import {
   Aviso,
@@ -77,6 +77,8 @@ export default function ProveedoresAdmin() {
   const [aBorrar, setABorrar] = useState(null)
   const [registrando, setRegistrando] = useState(null)
   const [avisoWebhook, setAvisoWebhook] = useState(null) // {ok, detalle}
+  const [probando, setProbando] = useState(null)
+  const [prueba, setPrueba] = useState(null) // {id, ok, detalle}
 
   const cargar = useCallback(async () => {
     try {
@@ -167,6 +169,23 @@ export default function ProveedoresAdmin() {
     }
   }
 
+  // Misma prueba que en la subcuenta (POST …/probar: SMTP hace verify(), Brevo consulta la cuenta);
+  // el backend deja status/last_error/last_check_at actualizados y la tabla se recarga.
+  const probar = async (p) => {
+    setProbando(p.id)
+    setPrueba(null)
+    try {
+      const d = await adminProbarProveedor(p.id)
+      setPrueba({ id: p.id, ok: d?.ok !== false, detalle: d?.detalle || 'Conexión correcta.' })
+      await cargar()
+    } catch (err) {
+      setPrueba({ id: p.id, ok: false, detalle: err.message })
+      await cargar()
+    } finally {
+      setProbando(null)
+    }
+  }
+
   const registrarWebhook = async (p) => {
     setRegistrando(p.id)
     setAvisoWebhook(null)
@@ -213,6 +232,12 @@ export default function ProveedoresAdmin() {
       </div>
 
       {error && <Aviso variant="error">{error}</Aviso>}
+      {prueba && (
+        <Aviso variant={prueba.ok ? 'ok' : 'error'} onCerrar={() => setPrueba(null)}>
+          {prueba.ok ? 'Conexión correcta: ' : 'La conexión ha fallado: '}
+          {prueba.detalle}
+        </Aviso>
+      )}
       {avisoWebhook && (
         <Aviso variant={avisoWebhook.ok ? 'ok' : 'aviso'} onCerrar={() => setAvisoWebhook(null)}>
           {avisoWebhook.detalle}
@@ -258,6 +283,14 @@ export default function ProveedoresAdmin() {
                   {p.daily_limit ?? 'Sin límite'}
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60 text-right whitespace-nowrap">
+                  <button
+                    type="button"
+                    className="text-xs text-gold hover:underline mr-3 disabled:opacity-60 disabled:no-underline"
+                    disabled={probando === p.id}
+                    onClick={() => probar(p)}
+                  >
+                    {probando === p.id ? 'Probando…' : 'Probar conexión'}
+                  </button>
                   <button type="button" className="text-xs text-ink2 hover:text-ink mr-3" onClick={() => abrirEditar(p)}>
                     Editar
                   </button>

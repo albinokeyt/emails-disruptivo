@@ -10,6 +10,7 @@ import {
   Mail,
   MailOpen,
   Paperclip,
+  PenSquare,
   Plus,
   RefreshCw,
   Reply,
@@ -34,6 +35,7 @@ import {
   obtenerEspacioBuzon,
   obtenerMensajeBuzon,
   probarCuentaBuzon,
+  redactarDesdeBuzon,
   reenviarMensajeBuzon,
   responderMensajeBuzon,
   sincronizarCuentaBuzon,
@@ -57,7 +59,7 @@ import { Detalle as DetalleEnvio } from './Envios.jsx'
 
 /* ============================================================
    Buzón (SPEC §14.4): tres columnas tipo Gmail — cuentas y carpetas · lista · detalle con hilo.
-   El correo lo trae el backend por IMAP; aquí solo se lee, se responde y se borra.
+   El correo lo trae el backend por IMAP; aquí se lee, se responde, se redacta y se borra.
    ============================================================ */
 
 const COLUMNA = 'bg-card border border-border rounded-2xl flex flex-col min-h-0 overflow-hidden'
@@ -143,7 +145,12 @@ const fechaLarga = (v) =>
 
 const sinPrefijo = (s) => String(s || '').replace(/^\s*((re|fwd?|rv|tr|aw|wg)\s*:\s*)+/i, '').trim()
 
-const separarCorreos = (s) => String(s || '').split(/[,;\n]/).map((x) => x.trim().toLowerCase()).filter(Boolean)
+// Acepta «correo» y «Nombre <correo>» (como el backend): se queda con la dirección, en minúsculas.
+const separarCorreos = (s) =>
+  String(s || '')
+    .split(/[,;\n]/)
+    .map((x) => (x.match(/<([^>]+)>/)?.[1] ?? x).trim().toLowerCase())
+    .filter(Boolean)
 
 /* ------------------------------------------------------------
    HTML del correo: texto → HTML del composer y bloqueo de imágenes remotas del visor
@@ -288,7 +295,7 @@ export default function Buzon() {
   const filasRef = useRef(null)
   filasRef.current = filas
 
-  const [composer, setComposer] = useState(null) // { modo, mensaje }
+  const [composer, setComposer] = useState(null) // { modo, mensaje } — en «redactar» mensaje es null
   const [aBorrar, setABorrar] = useState(null) // mensaje
   const [borrarServidor, setBorrarServidor] = useState(false)
   const [borrando, setBorrando] = useState(false)
@@ -446,6 +453,18 @@ export default function Buzon() {
     cargarLista(pagina, true)
   }
 
+  // Un correo redactado no cuelga de ningún mensaje recibido, así que el filtro por cuenta de la
+  // carpeta «Enviados» no lo enseñaría: se abre esa carpeta con todas las cuentas para que se vea.
+  const alRedactado = () => {
+    setComposer(null)
+    setAviso({ tipo: 'ok', texto: 'Correo encolado: lo verás en Enviados desde el buzón y en Envíos.' })
+    if (carpeta === 'enviados' && !cuentaId) cargarLista(1, true)
+    else {
+      setCarpeta('enviados')
+      setCuentaId('')
+    }
+  }
+
   const alCambiarCuentas = async () => {
     await Promise.all([cargarCuentas().catch((e) => setError(e.message)), cargarEspacio()])
     cargarLista(1, true)
@@ -478,6 +497,9 @@ export default function Buzon() {
         </div>
         <div className="flex items-center gap-3 flex-wrap">
           <BarraEspacio espacio={espacio} compacta />
+          <Boton icono={PenSquare} onClick={() => setComposer({ modo: 'redactar', mensaje: null })} title="Escribir un correo nuevo">
+            Redactar
+          </Boton>
           <Boton variant="ghost" icono={RefreshCw} onClick={sincronizar} cargando={sincronizando} disabled={sinCuentas}>
             {cuentaActiva ? 'Sincronizar esta cuenta' : 'Sincronizar'}
           </Boton>
@@ -628,7 +650,7 @@ export default function Buzon() {
                     {q
                       ? 'Nada coincide con esa búsqueda.'
                       : carpeta === 'enviados'
-                        ? 'Todavía no has respondido ni reenviado nada desde el buzón.'
+                        ? 'Todavía no has redactado, respondido ni reenviado nada desde el buzón.'
                         : carpeta === 'no_leidos'
                           ? 'No tienes correo sin leer.'
                           : 'Todavía no hay correo. Pulsa «Sincronizar» para traerlo ahora.'}
@@ -705,10 +727,12 @@ export default function Buzon() {
         <Composer
           modo={composer.modo}
           mensaje={composer.mensaje}
-          cuenta={porCuenta.get(String(composer.mensaje.mailbox_id))}
+          // un correo nuevo parte de la cuenta activa (su remitente y su Reply-To) y se puede cambiar en el modal
+          cuenta={composer.mensaje ? porCuenta.get(String(composer.mensaje.mailbox_id)) : cuentaActiva}
+          cuentas={cuentas}
           remitentes={remitentes}
           onCerrar={() => setComposer(null)}
-          onEnviado={alEnviado}
+          onEnviado={composer.modo === 'redactar' ? alRedactado : alEnviado}
         />
       )}
 
@@ -1050,34 +1074,68 @@ function DetalleMensaje({ id, version, porCuenta, onCargado, onVolver, onRespond
 }
 
 /* ============================================================
-   Composer: responder, responder a todos y reenviar
+   Composer: responder, responder a todos, reenviar y redactar (correo nuevo, sin original)
    ============================================================ */
 const TITULOS = {
   responder: 'Responder',
   responder_todos: 'Responder a todos',
   reenviar: 'Reenviar',
+  redactar: 'Nuevo correo',
 }
+const MAX_DESTINATARIOS = 20
+const MAX_ASUNTO = 255
 
-function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
+const etiquetaCuenta = (c) => (c.name && c.name !== c.email ? `${c.name} (${c.email})` : c.email)
+
+// Remitente con el que se preselecciona «Enviar desde»: el de la cuenta, o el por defecto, o el primero.
+const remitentePara = (cuenta, remitentes) =>
+  String(cuenta?.reply_sender_id || '') ||
+  String(remitentes.find((r) => r.is_default)?.id || '') ||
+  String(remitentes[0]?.id || '')
+
+function Composer({ modo, mensaje, cuenta: cuentaInicial, cuentas = [], remitentes, onCerrar, onEnviado }) {
   const esReenvio = modo === 'reenviar'
+  const esNuevo = modo === 'redactar'
   const todos = modo === 'responder_todos'
+
+  // En un correo nuevo la cuenta del buzón es la que recibirá las contestaciones (Reply-To) y se
+  // elige en el propio modal: por defecto la activa, o la única que haya. En responder y reenviar
+  // es la del mensaje original y no se toca.
+  const cuentasActivas = esNuevo ? cuentas.filter((c) => c.enabled !== false) : []
+  const cuentaPorDefecto = esNuevo
+    ? (cuentasActivas.find((c) => mismoId(c.id, cuentaInicial?.id)) ?? (cuentasActivas.length === 1 ? cuentasActivas[0] : null))
+    : cuentaInicial
+  const [mailboxId, setMailboxId] = useState(cuentaPorDefecto ? String(cuentaPorDefecto.id) : '')
+  const cuenta = esNuevo ? cuentasActivas.find((c) => String(c.id) === mailboxId) ?? null : cuentaInicial
+
   const de = remitenteDe(mensaje)
   const propio = String(cuenta?.email || '').toLowerCase()
   const enCopia = [...destinatariosDe(mensaje, 'to'), ...destinatariosDe(mensaje, 'cc')].filter(
     (p) => p.email && p.email.toLowerCase() !== propio && p.email.toLowerCase() !== de.email.toLowerCase(),
   )
-  const asunto = `${esReenvio ? 'Fwd' : 'Re'}: ${sinPrefijo(mensaje.subject) || '(sin asunto)'}`
+  const asunto = esNuevo ? '' : `${esReenvio ? 'Fwd' : 'Re'}: ${sinPrefijo(mensaje.subject) || '(sin asunto)'}`
+  const descripcion = esNuevo
+    ? cuenta
+      ? `Las contestaciones entrarán en ${etiquetaCuenta(cuenta)}.`
+      : 'Sale por el proveedor del remitente que elijas, como cualquier otro envío.'
+    : asunto
 
-  const remitenteInicial =
-    String(cuenta?.reply_sender_id || '') ||
-    String(remitentes.find((r) => r.is_default)?.id || '') ||
-    String(remitentes[0]?.id || '')
-  const [form, setForm] = useState({ sender_id: remitenteInicial, to: '', cc: '', bcc: '', texto: '' })
+  const [form, setForm] = useState({ sender_id: remitentePara(cuentaPorDefecto, remitentes), to: '', cc: '', bcc: '', asunto: '', texto: '' })
   const [vista, setVista] = useState('escribir')
   const [errores, setErrores] = useState([])
   const [enviando, setEnviando] = useState(false)
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
+
+  // Al cambiar la cuenta del buzón, «Enviar desde» pasa a su remitente configurado (si lo tiene)
+  const cambiarCuenta = (e) => {
+    const id = e.target.value
+    setMailboxId(id)
+    const elegida = cuentasActivas.find((c) => String(c.id) === id)
+    if (elegida?.reply_sender_id && remitentes.some((r) => String(r.id) === String(elegida.reply_sender_id))) {
+      setForm((f) => ({ ...f, sender_id: String(elegida.reply_sender_id) }))
+    }
+  }
 
   const enviar = async (e) => {
     e.preventDefault()
@@ -1088,9 +1146,18 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
     const to = separarCorreos(form.to)
     const ccLista = separarCorreos(form.cc)
     const bccLista = separarCorreos(form.bcc)
+    const asuntoNuevo = form.asunto.trim()
     if (esReenvio) {
       if (to.length === 0) fallos.push('Indica a quién quieres reenviarlo.')
       if (to.length > 1) fallos.push('Reenvía a una sola dirección cada vez.')
+    }
+    if (esNuevo) {
+      if (to.length === 0) fallos.push('Indica al menos un destinatario en Para.')
+      if (to.length + ccLista.length + bccLista.length > MAX_DESTINATARIOS) {
+        fallos.push(`Como mucho ${MAX_DESTINATARIOS} direcciones entre Para, CC y CCO.`)
+      }
+      if (!asuntoNuevo) fallos.push('Escribe el asunto.')
+      else if (asuntoNuevo.length > MAX_ASUNTO) fallos.push(`El asunto no puede pasar de ${MAX_ASUNTO} caracteres.`)
     }
     for (const [etiqueta, l] of [['Para', to], ['CC', ccLista], ['CCO', bccLista]]) {
       const malos = l.filter((x) => !CORREO.test(x))
@@ -1102,7 +1169,18 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
     const cuerpo = { html: textoAHtml(form.texto), text: form.texto.replace(/\r\n?/g, '\n').trim(), sender_id: Number(form.sender_id) }
     setEnviando(true)
     try {
-      if (esReenvio) {
+      if (esNuevo) {
+        await redactarDesdeBuzon({
+          mailbox_id: mailboxId ? Number(mailboxId) : undefined,
+          sender_id: cuerpo.sender_id,
+          para: to,
+          cc: ccLista.length ? ccLista : undefined,
+          bcc: bccLista.length ? bccLista : undefined,
+          asunto: asuntoNuevo,
+          cuerpo: cuerpo.text,
+          html: cuerpo.html,
+        })
+      } else if (esReenvio) {
         await reenviarMensajeBuzon(mensaje.id, { ...cuerpo, to: to[0] })
       } else {
         await responderMensajeBuzon(mensaje.id, {
@@ -1131,7 +1209,7 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
   )
 
   return (
-    <Modal titulo={TITULOS[modo]} descripcion={asunto} onCerrar={onCerrar} ancho="max-w-2xl">
+    <Modal titulo={TITULOS[modo]} descripcion={descripcion} onCerrar={onCerrar} ancho="max-w-2xl">
       <form onSubmit={enviar} className="space-y-4">
         {errores.length > 0 && (
           <Aviso variant="error">
@@ -1162,7 +1240,7 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
             onChange={set('sender_id')}
             hint={
               cuenta?.reply_sender_id
-                ? 'Remitente configurado para responder desde esta cuenta. Puedes cambiarlo solo para este correo.'
+                ? `Remitente configurado para ${esNuevo ? 'la cuenta' : 'responder desde esta cuenta'}. Puedes cambiarlo solo para este correo.`
                 : 'El correo sale por el proveedor de este remitente, como cualquier otro envío.'
             }
           >
@@ -1175,7 +1253,37 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
           </Select>
         )}
 
-        {esReenvio ? (
+        {esNuevo && cuentasActivas.length > 0 && (
+          <Select
+            label="Recibir las respuestas en"
+            value={mailboxId}
+            onChange={cambiarCuenta}
+            hint={
+              mailboxId
+                ? 'La contestación entrará en esta cuenta del buzón (va como Reply-To) aunque el remitente sea otra dirección.'
+                : 'Sin cuenta del buzón, la contestación irá a la dirección del remitente y no la verás aquí.'
+            }
+          >
+            {cuentasActivas.length > 1 && <option value="">Ninguna cuenta del buzón</option>}
+            {cuentasActivas.map((c) => (
+              <option key={c.id} value={c.id}>
+                {etiquetaCuenta(c)}
+              </option>
+            ))}
+          </Select>
+        )}
+
+        {esNuevo ? (
+          <Campo
+            label="Para"
+            placeholder="uno@dominio.com, otro@dominio.com"
+            hint="Uno o varios correos separados por coma."
+            value={form.to}
+            onChange={set('to')}
+            autoComplete="off"
+            autoFocus
+          />
+        ) : esReenvio ? (
           <Campo
             label="Para"
             type="email"
@@ -1207,6 +1315,10 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
           </div>
         )}
 
+        {esNuevo && (
+          <Campo label="Asunto" placeholder="De qué va el correo" value={form.asunto} onChange={set('asunto')} maxLength={MAX_ASUNTO} autoComplete="off" />
+        )}
+
         <div>
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-xs text-ink2">Mensaje</span>
@@ -1216,15 +1328,25 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
             </div>
           </div>
           {vista === 'escribir' ? (
-            <Textarea rows={10} value={form.texto} onChange={set('texto')} placeholder="Escribe tu respuesta…" autoFocus={!esReenvio} />
+            <Textarea
+              rows={10}
+              value={form.texto}
+              onChange={set('texto')}
+              placeholder={esNuevo ? 'Escribe tu mensaje…' : 'Escribe tu respuesta…'}
+              autoFocus={!esReenvio && !esNuevo}
+            />
           ) : (
             <div className="bg-white rounded-xl overflow-hidden border border-border">
-              <iframe title="Vista previa de la respuesta" sandbox={SANDBOX_CORREO} className="w-full h-64 bg-white" srcDoc={documentoCorreo(textoAHtml(form.texto) || '<p style="color:#9ca3af">Nada que mostrar todavía.</p>', true)} />
+              <iframe title={esNuevo ? 'Vista previa del correo' : 'Vista previa de la respuesta'} sandbox={SANDBOX_CORREO} className="w-full h-64 bg-white" srcDoc={documentoCorreo(textoAHtml(form.texto) || '<p style="color:#9ca3af">Nada que mostrar todavía.</p>', true)} />
             </div>
           )}
           <p className="text-[11px] text-mut mt-1">
             Texto plano: los párrafos y los enlaces se convierten solos a HTML.
-            {esReenvio ? ' El mensaje original va citado a continuación.' : ' El mensaje original se cita al final, como en cualquier cliente de correo.'}
+            {esNuevo
+              ? ' Los adjuntos llegarán en una próxima versión.'
+              : esReenvio
+                ? ' El mensaje original va citado a continuación.'
+                : ' El mensaje original se cita al final, como en cualquier cliente de correo.'}
           </p>
         </div>
 
@@ -1240,7 +1362,7 @@ function Composer({ modo, mensaje, cuenta, remitentes, onCerrar, onEnviado }) {
             Cancelar
           </Boton>
           <Boton type="submit" icono={Send} cargando={enviando} disabled={remitentes.length === 0}>
-            {esReenvio ? 'Reenviar' : 'Enviar respuesta'}
+            {esNuevo ? 'Enviar' : esReenvio ? 'Reenviar' : 'Enviar respuesta'}
           </Boton>
         </div>
       </form>

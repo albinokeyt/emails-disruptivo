@@ -20,10 +20,10 @@ import { cabecera, esEmail, idDe, paginar, texto } from './location.js'
 // La contraseña IMAP se guarda cifrada (AES-256-GCM, la misma clave que las credenciales de los
 // proveedores) y NUNCA vuelve al panel: se devuelve { configurado: true }.
 //
-// Responder y reenviar NO abren ninguna conexión SMTP propia: encolan una fila en `messages` con
-// origin='buzon' y cabeceras de hilo en extra_headers, y el worker de envío la saca por el remitente
-// y proveedor de siempre. Así pasan por la lista de supresión, los límites de envío, el tracking y el
-// historial como cualquier otro correo.
+// Responder, reenviar y redactar NO abren ninguna conexión SMTP propia: encolan una fila en `messages`
+// con origin='buzon' (y cabeceras de hilo en extra_headers cuando contestan a algo), y el worker de
+// envío la saca por el remitente y proveedor de siempre. Así pasan por la lista de supresión, los
+// límites de envío, el tracking y el historial como cualquier otro correo.
 
 const MAX_CUENTAS = 20
 const MAX_NOMBRE = 120
@@ -31,6 +31,7 @@ const MAX_USUARIO = 320
 const MAX_CONTRASENA = 1000
 const MAX_CARPETA = 200
 const MAX_ASUNTO = 500
+const MAX_ASUNTO_NUEVO = 255 // asunto escrito a mano en «Redactar»
 const MAX_HTML = 1_000_000
 const MAX_DESTINATARIOS_COPIA = 20
 const MAX_HILO = 100
@@ -572,11 +573,17 @@ function replyToDe(remitente, cuentaEmail) {
 // Encolado en `messages` (mismo patrón que los nodos de GHL en src/routes/actions.js)
 // ---------------------------------------------------------------------------
 
+// `original` es el mensaje recibido al que se contesta o reenvía; null en un correo nuevo
+// (Redactar): sin In-Reply-To ni inbox_reply_to_id, y abre hilo propio con el correlation_id como
+// thread_key, de modo que la contestación que entre por IMAP (buzon-sync hereda el thread_key por
+// provider_message_id) caiga en su hilo. `cuentaEmail` es la cuenta IMAP a la que deben volver las
+// contestaciones (Reply-To); en respuestas y reenvíos es la del original.
 async function encolarDesdeBuzon({
-  locationId, log, original, remitente, proveedor, destino, nombreDestino, cc, bcc, asunto, html, text,
+  locationId, log, original = null, cuentaEmail = original?.cuenta_email, remitente, proveedor,
+  destino, nombreDestino, cc, bcc, asunto, html, text,
 }) {
-  // Suscripción en el Marketplace Disruptivo: responder o reenviar desde el buzón también es un
-  // envío, así que se corta aquí con el texto literal (403: la sesión sigue siendo válida).
+  // Suscripción en el Marketplace Disruptivo: responder, reenviar o redactar desde el buzón también
+  // es un envío, así que se corta aquí con el texto literal (403: la sesión sigue siendo válida).
   const acceso = await tieneAcceso(locationId, { log })
   if (!acceso.access) throw fallo(403, MENSAJE_SIN_ACCESO)
 
@@ -601,6 +608,7 @@ async function encolarDesdeBuzon({
     if (!cupo.ok) throw fallo(429, cupo.motivo || 'Se ha alcanzado el límite de envíos de esta subcuenta')
   }
 
+  const correlacion = randomCorrelationId()
   const { rows: [insertado] } = await q(
     `INSERT INTO messages (location_id, provider_id, sender_id, template_id, origin, status, status_rank,
                            to_email, to_name, cc, bcc, reply_to, subject, preheader, html, text,
@@ -609,9 +617,9 @@ async function encolarDesdeBuzon({
      RETURNING id, status, created_at`,
     [
       locationId, proveedor.id, remitente.id, estado, rango,
-      destino, nombreDestino, ccFinal, bccFinal, replyToDe(remitente, original.cuenta_email),
-      asunto, html, text, randomCorrelationId(), ultimoError,
-      JSON.stringify(cabecerasHilo(original)), original.id, original.thread_key,
+      destino, nombreDestino, ccFinal, bccFinal, replyToDe(remitente, cuentaEmail),
+      asunto, html, text, correlacion, ultimoError,
+      JSON.stringify(original ? cabecerasHilo(original) : {}), original?.id ?? null, original?.thread_key ?? correlacion,
     ]
   )
 
@@ -631,7 +639,7 @@ async function encolarDesdeBuzon({
   }
 
   // Contestar o reenviar algo es haberlo leído.
-  await q('UPDATE inbox_messages SET is_read = true WHERE id = $1 AND NOT is_read', [original.id])
+  if (original) await q('UPDATE inbox_messages SET is_read = true WHERE id = $1 AND NOT is_read', [original.id])
 
   return {
     ok: true,
@@ -1228,7 +1236,7 @@ export default async function buzonRoutes(app) {
   })
 
   // ---------------------------------------------------------------------------
-  // Responder y reenviar: se encola en `messages` (origin='buzon')
+  // Responder, reenviar y redactar: se encola en `messages` (origin='buzon')
   // ---------------------------------------------------------------------------
 
   // {html, text, sender_id?, todos, cc, bcc} → Re: … con la cita del original al final
@@ -1348,6 +1356,70 @@ export default async function buzonRoutes(app) {
         const nota = 'Los adjuntos del mensaje original no se reenvían en esta versión: descárgalos y adjúntalos desde tu correo si hacen falta'
         resultado.aviso = resultado.aviso ? `${resultado.aviso}. ${nota}` : nota
       }
+      return reply.code(201).send(resultado)
+    } catch (err) {
+      if (err?.codigo) return reply.code(err.codigo).send({ error: err.message })
+      throw err
+    }
+  })
+
+  // Redactar: correo nuevo que no contesta a nada. {mailbox_id?, sender_id?, para, cc?, bcc?, asunto,
+  // cuerpo (texto plano) | html} → misma cola, supresión, límites y corte de suscripción que responder.
+  // Con mailbox_id, las contestaciones vuelven a esa cuenta IMAP (Reply-To) y el remitente por
+  // defecto es el suyo; el primer «Para» va en to_email y el resto en copia (una fila = un destino).
+  app.post('/api/loc/buzon/redactar', guard, async (req, reply) => {
+    const locationId = loc(req)
+    const b = req.body || {}
+
+    const para = parseLista(b.para ?? b.to, 'Para')
+    if (para.error) return malo(reply, para.error)
+    if (!para.lista.length) return malo(reply, 'Indica al menos un destinatario válido en «Para»')
+    const ccBody = parseLista(b.cc, 'CC')
+    if (ccBody.error) return malo(reply, ccBody.error)
+    const bccBody = parseLista(b.bcc, 'BCC')
+    if (bccBody.error) return malo(reply, bccBody.error)
+
+    const asunto = cabecera(b.asunto ?? b.subject, MAX_ASUNTO_NUEVO + 1)
+    if (!asunto) return malo(reply, 'El asunto es obligatorio')
+    if (asunto.length > MAX_ASUNTO_NUEVO) return malo(reply, `El asunto no puede pasar de ${MAX_ASUNTO_NUEVO} caracteres`)
+
+    // `cuerpo` es texto plano (se convierte a HTML sencillo, escapado); `html` va ya montado
+    const cuerpo = cuerpoUsuario({ html: b.html, text: b.cuerpo ?? b.text })
+    if (cuerpo.error) return malo(reply, cuerpo.error)
+
+    let cuenta = null
+    if (b.mailbox_id !== undefined && b.mailbox_id !== null && b.mailbox_id !== '') {
+      const mailboxId = idDe(b.mailbox_id)
+      cuenta = mailboxId ? await cuentaDe(mailboxId, locationId) : null
+      if (!cuenta) return malo(reply, 'La cuenta de buzón indicada no existe en tu subcuenta')
+    }
+
+    try {
+      const remitente = await resolverRemitente(locationId, b.sender_id, cuenta?.reply_sender_id)
+      const proveedor = await proveedorDe(remitente, locationId)
+
+      const [destino, ...resto] = para.lista
+      const cc = [...resto]
+      for (const e of ccBody.lista) if (e !== destino && !cc.includes(e)) cc.push(e)
+      const bcc = bccBody.lista.filter((e) => e !== destino && !cc.includes(e))
+      if (1 + cc.length + bcc.length > MAX_DESTINATARIOS_COPIA) {
+        return malo(reply, `Demasiados destinatarios (máximo ${MAX_DESTINATARIOS_COPIA} entre Para, CC y CCO)`)
+      }
+
+      const resultado = await encolarDesdeBuzon({
+        locationId,
+        log: req.log,
+        cuentaEmail: cuenta?.email,
+        remitente,
+        proveedor,
+        destino,
+        nombreDestino: null,
+        cc,
+        bcc,
+        asunto,
+        html: cuerpo.html,
+        text: cuerpo.text,
+      })
       return reply.code(201).send(resultado)
     } catch (err) {
       if (err?.codigo) return reply.code(err.codigo).send({ error: err.message })
