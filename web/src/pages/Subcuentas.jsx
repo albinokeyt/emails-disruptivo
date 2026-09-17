@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { adminCuotaBuzon, adminEspacioBuzon, adminRecomprobarAcceso, api, fmtBytes } from '../api.js'
+import { adminCuotaBuzon, adminEspacioBuzon, adminNombrarSubcuenta, adminRecomprobarAcceso, api, fmtBytes } from '../api.js'
 import { Aviso, Badge, Boton, Campo, Copiar, Modal, Spinner, Tabla } from '../components/ui.jsx'
 
 const TARJETA = 'bg-card border border-border rounded-2xl p-5'
@@ -154,6 +154,9 @@ export default function Subcuentas() {
   const [errorCuota, setErrorCuota] = useState('')
   const [marketplace, setMarketplace] = useState(null) // { configurado, base_url, cache_seg, gracia_horas }
   const [recomprobando, setRecomprobando] = useState(null)
+  const [nombre, setNombre] = useState(null) // { subcuenta, valor }
+  const [guardandoNombre, setGuardandoNombre] = useState(false)
+  const [errorNombre, setErrorNombre] = useState('')
 
   const cargar = useCallback(async () => {
     try {
@@ -216,6 +219,32 @@ export default function Subcuentas() {
       setErrorCuota(err.message)
     } finally {
       setGuardandoCuota(false)
+    }
+  }
+
+  const abrirNombre = (s) => {
+    setErrorNombre('')
+    setNombre({ subcuenta: s, valor: s.name || '' })
+  }
+
+  // El nombre se guarda tal cual y la fila se actualiza sin recargar toda la tabla; vacío = sin nombre.
+  const guardarNombre = async (e) => {
+    e.preventDefault()
+    const v = nombre.valor.trim()
+    if (v.length > 200) {
+      setErrorNombre('El nombre no puede pasar de 200 caracteres.')
+      return
+    }
+    setGuardandoNombre(true)
+    try {
+      const r = await adminNombrarSubcuenta(nombre.subcuenta.location_id, v)
+      const nuevo = r?.name ?? (v || null)
+      setDatos((lista) => (lista || []).map((x) => (x.location_id === nombre.subcuenta.location_id ? { ...x, name: nuevo } : x)))
+      setNombre(null)
+    } catch (err) {
+      setErrorNombre(err.message)
+    } finally {
+      setGuardandoNombre(false)
     }
   }
 
@@ -291,8 +320,24 @@ export default function Subcuentas() {
             {filtradas.map((s) => (
               <tr key={s.location_id}>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60">
-                  <div className="font-medium">{s.name || 'Sin nombre'}</div>
+                  <div className="flex items-center gap-1.5">
+                    <span className={`font-medium ${s.name ? '' : 'text-mut'}`}>{s.name || 'Sin nombre'}</span>
+                    <button
+                      type="button"
+                      className="text-mut hover:text-gold text-[11px] leading-none"
+                      title={s.name ? 'Cambiar el nombre' : 'Poner nombre a la subcuenta'}
+                      aria-label="Editar nombre"
+                      onClick={() => abrirNombre(s)}
+                    >
+                      ✎
+                    </button>
+                  </div>
                   <div className="text-[11px] text-mut font-mono">{s.location_id}</div>
+                  {!s.con_token && (
+                    <div className="text-[11px] text-warn" title="La subcuenta abrió el panel sin pasar por el enlace de instalación: la app no tiene token de API de GHL (nombre automático y DND en Rebotados no disponibles).">
+                      Sin token de GHL
+                    </div>
+                  )}
                 </td>
                 <td className="px-3 py-2.5 text-sm border-t border-border/60">
                   <Badge status={s.status} />
@@ -373,6 +418,42 @@ export default function Subcuentas() {
           </li>
         </ul>
       </div>
+
+      {nombre && (
+        <Modal
+          title="Nombre de la subcuenta"
+          description={`Se muestra en el pie del panel de la subcuenta y en las listas de la agencia (${nombre.subcuenta.location_id}).`}
+          onClose={() => setNombre(null)}
+        >
+          <form onSubmit={guardarNombre} className="space-y-4">
+            {errorNombre && <Aviso variant="error">{errorNombre}</Aviso>}
+            {!nombre.subcuenta.con_token && (
+              <Aviso variant="info">
+                Esta subcuenta no tiene token de API de GHL (abrió el panel sin pasar por el enlace de instalación), así
+                que la app no puede leer su nombre sola. Si además quieres el DND automático de Rebotados, instala la app
+                en esa subcuenta desde <code className="text-ink">/api/oauth/instalar</code>: el nombre se rellenará solo.
+              </Aviso>
+            )}
+            <Campo
+              label="Nombre"
+              placeholder="Como quieres verla en el panel"
+              value={nombre.valor}
+              onChange={(e) => setNombre((n) => ({ ...n, valor: e.target.value }))}
+              maxLength={200}
+              autoFocus
+              hint="Déjalo vacío para volver a «Sin nombre»."
+            />
+            <div className="flex justify-end gap-2 pt-1">
+              <Boton type="button" variant="ghost" onClick={() => setNombre(null)} disabled={guardandoNombre}>
+                Cancelar
+              </Boton>
+              <Boton type="submit" cargando={guardandoNombre}>
+                Guardar nombre
+              </Boton>
+            </div>
+          </form>
+        </Modal>
+      )}
 
       {cuota && (
         <Modal

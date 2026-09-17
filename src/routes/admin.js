@@ -179,6 +179,24 @@ export default async function adminRoutes(app) {
     return rows.length > 0
   }
 
+  // Nombre a mano. Una subcuenta que solo ha abierto la Custom Page (sin pasar por el enlace de
+  // instalación OAuth) no tiene token y la app no puede preguntarle el nombre a GHL: queda «Sin
+  // nombre» en el pie del panel. La agencia lo pone aquí; vacío = volver a dejarlo sin nombre.
+  app.patch('/api/admin/subcuentas/:locationId', guard, async (req, reply) => {
+    const locationId = texto(req.params.locationId)
+    if (!locationId || !(await subcuentaExiste(locationId))) {
+      return reply.code(404).send({ error: 'Subcuenta no encontrada' })
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {}
+    if (!('name' in body)) return malo(reply, 'Falta el campo name')
+    const name = texto(body.name).replace(/\s+/g, ' ').slice(0, 200) || null
+    const { rows: [conn] } = await q(
+      'UPDATE connections SET name=$1, updated_at=now() WHERE location_id=$2 RETURNING location_id, name',
+      [name, locationId]
+    )
+    return { ok: true, location_id: conn.location_id, name: conn.name }
+  })
+
   // Olvida la cache y vuelve a preguntar al marketplace por una subcuenta (tras dar o quitar un
   // acceso a mano, sin esperar los 5 minutos). Es la única llamada en vivo que dispara la agencia,
   // así que va limitada por admin: 60 por minuto, muy por debajo del límite del marketplace.

@@ -254,6 +254,9 @@ export const adminRecomprobarAcceso = (locationId) =>
   api.post(`/api/admin/subcuentas/${encodeURIComponent(locationId)}/acceso/recomprobar`)
 export const adminCuotaBuzon = (locationId, quotaMb) =>
   api.patch(`/api/admin/subcuentas/${encodeURIComponent(locationId)}/buzon`, { quota_mb: quotaMb })
+// Nombre a mano (la subcuenta sin token OAuth no puede pedírselo a GHL); vacío = sin nombre
+export const adminNombrarSubcuenta = (locationId, name) =>
+  api.patch(`/api/admin/subcuentas/${encodeURIComponent(locationId)}`, { name })
 
 export const adminObtenerAjustes = () => api.get('/api/admin/ajustes')
 export const adminGuardarAjustes = (datos) => api.put('/api/admin/ajustes', datos)
