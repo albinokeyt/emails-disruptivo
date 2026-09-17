@@ -190,9 +190,20 @@ export async function sesionActual(req) {
   const loc = await getSesionLocation(req)
   const admin = await getSesionAdmin(req)
   if (!loc && !admin) return null
+  // El nombre se lee fresco de connections: la agencia puede ponerlo a mano (o repararse solo)
+  // después de abierta la sesión, y el pie del panel no debe seguir diciendo «Sin nombre».
+  let nombre = loc?.nombre ?? null
+  if (loc?.locationId) {
+    try {
+      const { rows: [c] } = await q('SELECT name FROM connections WHERE location_id=$1', [loc.locationId])
+      if (c?.name) nombre = c.name
+    } catch {
+      /* el de la sesión vale */
+    }
+  }
   return {
     locationId: loc?.locationId ?? null,
-    nombre: loc?.nombre ?? null,
+    nombre,
     email: loc?.email ?? admin?.email ?? null,
     esAdminAgencia: Boolean(admin) || Boolean(loc?.esAdminAgencia),
   }
