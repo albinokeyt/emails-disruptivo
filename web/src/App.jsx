@@ -51,19 +51,28 @@ function PanelSubcuenta() {
     setFallo(null)
     try {
       let actual = null
-      try { actual = await obtenerSesion() } catch { actual = null }
 
-      if (!actual) {
+      if (estamosEmbebidos()) {
+        // Dentro de GHL la identidad la manda SIEMPRE el iframe: se pide el contexto cifrado y se
+        // inicia sesión con él aunque ya hubiera cookie. La cookie es del dominio de la app y no
+        // sabe de subcuentas: si se reutilizara, al cambiar de subcuenta en GHL (misma pestaña,
+        // mismo navegador, menos de 12 h) el panel enseñaría los datos de la anterior.
         const intento = await iniciarSesionConSso()
         if (intento.ok) {
-          actual = intento.sesion
-          // el backend puede devolver solo la cookie: se relee para tener el contexto completo
-          if (!actual?.locationId) {
-            try { actual = await obtenerSesion() } catch { /* se trata abajo */ }
-          }
+          // la respuesta del SSO es corta (sin email ni plan): se relee el contexto completo
+          try { actual = await obtenerSesion() } catch { actual = intento.sesion }
+        } else if (intento.motivo === 'sin_respuesta') {
+          // GHL no ha contestado al postMessage: vale la sesión que hubiera (recarga de la misma
+          // pestaña), y solo si tampoco la hay se enseña el error
+          try { actual = await obtenerSesion() } catch { actual = null }
+          if (!actual) setFallo(intento)
         } else {
           setFallo(intento)
         }
+      } else {
+        // fuera de GHL (pestaña suelta) no hay iframe que preguntar: solo vale una sesión ya abierta
+        try { actual = await obtenerSesion() } catch { actual = null }
+        if (!actual) setFallo(await iniciarSesionConSso())
       }
 
       if (actual?.locationId) {

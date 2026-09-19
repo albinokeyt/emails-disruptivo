@@ -27,6 +27,11 @@ const errorHttp = (status, mensaje) => {
 }
 
 async function crearSesion(req, reply, cookie, datos, ttl, crossSite) {
+  // Una sesión nueva sustituye a la anterior del mismo navegador: el SSO del iframe vuelve a
+  // entrar en cada carga (y en cada cambio de subcuenta en GHL), así que la vieja se borra de
+  // Redis en vez de dejarla viva hasta su TTL.
+  const anterior = req?.cookies?.[cookie]
+  if (anterior) await redis.del(`sess:${cookie}:${anterior}`).catch(() => {})
   const token = randomBytes(32).toString('hex')
   await redis.set(`sess:${cookie}:${token}`, JSON.stringify(datos), 'EX', ttl)
   reply.setCookie(cookie, token, {
