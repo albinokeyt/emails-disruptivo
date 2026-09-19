@@ -238,6 +238,8 @@ export default async function oauthRoutes(app) {
         locationId: sesion.locationId,
         nombre: sesion.nombre,
         esAdminAgencia: Boolean(sesion.esAdminAgencia),
+        // token de la pestaña (sessionStorage → cabecera X-Ed-Sesion); null en contexto de agencia
+        token: sesion.token || null,
         acceso: await accesoDe(req, sesion.locationId),
       }
     } catch (err) {

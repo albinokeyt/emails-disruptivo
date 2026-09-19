@@ -26,12 +26,13 @@ const errorHttp = (status, mensaje) => {
   return err
 }
 
+// El panel de subcuenta manda además su token por cabecera: la cookie es UNA por navegador (y
+// por partición del iframe), así que dos pestañas de GHL con subcuentas distintas se la pisarían;
+// el token vive en el sessionStorage de cada pestaña y gana a la cookie. Las sesiones antiguas no
+// se borran al crear una nueva (otra pestaña puede seguir usándolas): caducan por TTL.
+const HEADER_LOC = 'x-ed-sesion'
+
 async function crearSesion(req, reply, cookie, datos, ttl, crossSite) {
-  // Una sesión nueva sustituye a la anterior del mismo navegador: el SSO del iframe vuelve a
-  // entrar en cada carga (y en cada cambio de subcuenta en GHL), así que la vieja se borra de
-  // Redis en vez de dejarla viva hasta su TTL.
-  const anterior = req?.cookies?.[cookie]
-  if (anterior) await redis.del(`sess:${cookie}:${anterior}`).catch(() => {})
   const token = randomBytes(32).toString('hex')
   await redis.set(`sess:${cookie}:${token}`, JSON.stringify(datos), 'EX', ttl)
   reply.setCookie(cookie, token, {
@@ -47,7 +48,11 @@ async function crearSesion(req, reply, cookie, datos, ttl, crossSite) {
 }
 
 async function leerSesion(req, cookie) {
-  const token = req.cookies?.[cookie]
+  let token = req.cookies?.[cookie]
+  if (cookie === COOKIE_LOC) {
+    const porCabecera = String(req.headers?.[HEADER_LOC] || '').trim()
+    if (/^[a-f0-9]{64}$/i.test(porCabecera)) token = porCabecera
+  }
   if (!token) return null
   const raw = await redis.get(`sess:${cookie}:${token}`)
   if (!raw) return null
@@ -133,7 +138,7 @@ async function recuperarNombreConexion(connectionId, locationId) {
  * sesiones que correspondan. Es el ÚNICO sitio de toda la app donde nace un location_id de sesión:
  * viene firmado con el Shared Secret, así que no se puede falsificar como sí se podría con un
  * parámetro de la URL.
- * Devuelve { locationId, nombre, esAdminAgencia } tal y como espera POST /api/sesion/sso.
+ * Devuelve { locationId, nombre, esAdminAgencia, token } tal y como espera POST /api/sesion/sso.
  */
 export async function iniciarSesionSso(req, reply, payloadCifrado) {
   if (!payloadCifrado) throw errorHttp(400, 'Falta el contexto cifrado de GoHighLevel')
@@ -179,7 +184,7 @@ export async function iniciarSesionSso(req, reply, payloadCifrado) {
 
   let nombre = conn?.name || null
   if (!nombre && conn?.id) nombre = await recuperarNombreConexion(conn.id, id.locationId)
-  await crearSesionLocation(req, reply, {
+  const token = await crearSesionLocation(req, reply, {
     locationId: id.locationId,
     nombre,
     email: id.email,
@@ -187,7 +192,8 @@ export async function iniciarSesionSso(req, reply, payloadCifrado) {
     companyId: id.companyId,
     esAdminAgencia,
   })
-  return { locationId: id.locationId, nombre, esAdminAgencia }
+  // el token viaja también en la respuesta para que la pestaña lo guarde y lo mande por cabecera
+  return { locationId: id.locationId, nombre, esAdminAgencia, token }
 }
 
 /** Resumen de la sesión activa para GET /api/sesion. null si no hay ninguna. */

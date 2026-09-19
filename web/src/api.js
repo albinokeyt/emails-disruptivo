@@ -31,13 +31,32 @@ export function emitir(nombre, detalle) {
   window.dispatchEvent(new CustomEvent(nombre, { detail: detalle || null }))
 }
 
+// Token de sesión de ESTA pestaña (panel de subcuenta). La cookie ed_loc es una por navegador, así
+// que dos pestañas de GHL con subcuentas distintas se la pisarían; el sessionStorage es por pestaña
+// y el backend prefiere la cabecera a la cookie. Sin sessionStorage (navegador que lo bloquea en
+// iframes) se sigue con la cookie como hasta ahora.
+const CLAVE_TOKEN = 'ed_loc_token'
+export function guardarTokenSesion(token) {
+  try {
+    if (token) sessionStorage.setItem(CLAVE_TOKEN, String(token))
+    else sessionStorage.removeItem(CLAVE_TOKEN)
+  } catch { /* sin almacenamiento: manda la cookie */ }
+}
+function tokenSesion() {
+  try { return sessionStorage.getItem(CLAVE_TOKEN) || '' } catch { return '' }
+}
+
 async function solicitar(metodo, ruta, cuerpo) {
   let res
   try {
+    const headers = {}
+    if (cuerpo !== undefined) headers['Content-Type'] = 'application/json'
+    const token = ambitoDeRuta(ruta) === 'location' ? tokenSesion() : ''
+    if (token) headers['X-Ed-Sesion'] = token
     res = await fetch(ruta, {
       method: metodo,
       credentials: 'same-origin',
-      headers: cuerpo === undefined ? undefined : { 'Content-Type': 'application/json' },
+      headers: Object.keys(headers).length ? headers : undefined,
       body: cuerpo === undefined ? undefined : JSON.stringify(cuerpo),
     })
   } catch {
@@ -83,7 +102,11 @@ export function consulta(filtros) {
 export const urlInstalacion = () => '/api/oauth/instalar'
 
 // `payload` es el paquete cifrado que devuelve GHL por postMessage (ver sso.js).
-export const iniciarSesionSso = (payload) => api.post('/api/sesion/sso', { payload })
+export const iniciarSesionSso = async (payload) => {
+  const r = await api.post('/api/sesion/sso', { payload })
+  guardarTokenSesion(r?.token || null)
+  return r
+}
 
 export const obtenerSesion = () => api.get('/api/sesion')
 
